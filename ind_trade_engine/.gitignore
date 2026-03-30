@@ -1,0 +1,206 @@
+# 🇮🇳 Trade Intelligence Engine
+# .gitignore — Reviewed and fixed for Streamlit Cloud deployment
+# ─────────────────────────────────────────────────────────────────────
+# WHAT CHANGED FROM YOUR ORIGINAL:
+#   + Added .streamlit/secrets.toml          ← CRITICAL — your API keys
+#   + Added data/                            ← datasets stay local
+#   + Added *.xls *.xlsx (data files)        ← ITC TradeMap files
+#   + Added *.json in data/ context          ← HS/duty JSON datasets
+#   + Added gemini_test.py                   ← local test file, not for prod
+#   + Added *.docx *.pdf (generated reports) ← don't commit binary outputs
+#   + Tightened .env to cover all variants
+# ─────────────────────────────────────────────────────────────────────
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 🔐 SECRETS — NEVER COMMIT THESE (your app breaks AND gets hacked)
+# ══════════════════════════════════════════════════════════════════════
+
+# Local .env file (contains NVIDIA_API_KEY, SUPABASE keys, SMTP passwords)
+.env
+.env.*
+.env.local
+.env.production
+.envrc
+
+# Streamlit secrets file (on Streamlit Cloud you use the Secrets UI instead)
+.streamlit/secrets.toml
+
+# Any file named secrets
+*secrets*
+*secret*
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 📊 DATA FILES — Keep local, NOT in Git (too large, may be proprietary)
+# ══════════════════════════════════════════════════════════════════════
+
+# ITC TradeMap dataset
+data/
+*.xls
+*.xlsx
+
+# HS Code / duty / GST JSON datasets (built from government sources)
+# These live in data/ which is already ignored above — but be explicit:
+# data/hs_codes.json
+# data/duty_structure.json
+# data/gst_rates.json
+# Note: data/ folder itself is ignored — no need to list individually
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 🐍 PYTHON
+# ══════════════════════════════════════════════════════════════════════
+
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.pyd
+
+# Distribution / packaging
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+.venv
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+.pixi
+__pypackages__/
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Testing / coverage
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py.cover
+.hypothesis/
+.pytest_cache/
+cover/
+
+# Misc Python tools
+.ruff_cache/
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pyre/
+.pytype/
+cython_debug/
+.pypirc
+pip-log.txt
+pip-delete-this-directory.txt
+*.sage.py
+
+# Notebook checkpoints
+.ipynb_checkpoints
+profile_default/
+ipython_config.py
+
+# PDM / Poetry / Pipenv lock files (optional — include if team project)
+.pdm-python
+.pdm-build/
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 📄 GENERATED OUTPUT FILES (don't commit AI-generated reports)
+# ══════════════════════════════════════════════════════════════════════
+
+*.pdf
+*.docx
+reports/
+exports/
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 🧪 LOCAL TEST / DEV FILES (not needed in production)
+# ══════════════════════════════════════════════════════════════════════
+
+gemini_test.py
+*_test.py
+test_*.py
+scratch*.py
+debug*.py
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 🖥️ EDITOR / OS
+# ══════════════════════════════════════════════════════════════════════
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Linux
+*~
+
+# VS Code (optional — some teams commit workspace settings)
+# .vscode/
+.vscode/settings.json
+.vscode/launch.json
+
+# JetBrains / PyCharm (optional)
+# .idea/
+.idea/
+
+# Cursor AI
+.cursorignore
+.cursorindexingignore
+
+# Abstra
+.abstra/
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 📦 LOGS / TEMP
+# ══════════════════════════════════════════════════════════════════════
+
+*.log
+local_settings.py
+*.sqlite3
+*.sqlite3-journal
+instance/
+/site
+.scrapy
+docs/_build/
+.pybuilder/
+target/
+.ropeproject
+.spyderproject
+.spyproject
+marimo/_static/
+marimo/_lsp/
+__marimo__/

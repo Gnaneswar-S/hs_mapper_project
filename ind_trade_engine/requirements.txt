@@ -1,0 +1,36 @@
+# Indian Trade Intelligence Engine v3.0 — Requirements
+# Install: pip install -r requirements.txt
+
+# ── Core ──────────────────────────────────────────────────────────
+streamlit>=1.35.0
+python-dotenv>=1.0.0
+requests>=2.31.0
+
+# ── Supabase ──────────────────────────────────────────────────────
+supabase>=2.4.0
+gotrue>=2.4.0
+
+# ── Data processing ───────────────────────────────────────────────
+pandas>=2.0.0
+numpy>=1.26.0
+openpyxl>=3.1.0
+xlrd>=2.0.1
+
+# ── Charts ────────────────────────────────────────────────────────
+plotly>=5.18.0
+
+# ── Document scanning ─────────────────────────────────────────────
+pdfplumber>=0.10.0
+pymupdf>=1.23.0
+pytesseract>=0.3.10
+Pillow>=10.0.0
+
+# ── Report export ─────────────────────────────────────────────────
+reportlab>=4.0.0
+
+# ── PostgreSQL direct (for data sync upload) ──────────────────────
+psycopg2-binary>=2.9.0
+
+# ── Testing ───────────────────────────────────────────────────────
+pytest>=7.4.0
+pytest-cov>=4.1.0
