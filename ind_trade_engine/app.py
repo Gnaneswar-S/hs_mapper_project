@@ -313,6 +313,8 @@ def page_header(title: str, subtitle: str = "", icon: str = "") -> None:
 
 
 def _download_row(result: dict, product: str, mode: str, email: str) -> None:
+    import hashlib as _hl, time as _t
+    _sfx = _hl.md5(f"{product}{mode}{email}{_t.monotonic()}".encode()).hexdigest()[:8]
     st.markdown("#### 📥 Download Report")
     dc1, dc2, dc3 = st.columns(3)
     with dc1:
@@ -321,7 +323,7 @@ def _download_row(result: dict, product: str, mode: str, email: str) -> None:
             st.download_button("📊 Excel (.xlsx)", data=buf,
                 file_name=get_report_filename(product, mode, "xlsx"),
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True)
+                use_container_width=True, key=f"dl_xlsx_{_sfx}")
         except Exception as e:
             st.error(f"Excel: {e}")
     with dc2:
@@ -329,14 +331,14 @@ def _download_row(result: dict, product: str, mode: str, email: str) -> None:
             buf = export_to_pdf(result, product, mode, email)
             st.download_button("📄 PDF (.pdf)", data=buf,
                 file_name=get_report_filename(product, mode, "pdf"),
-                mime="application/pdf", use_container_width=True)
+                mime="application/pdf", use_container_width=True, key=f"dl_pdf_{_sfx}")
         except Exception as e:
             st.error(f"PDF: {e}")
     with dc3:
         st.download_button("📋 JSON (.json)",
             data=_json.dumps(result, indent=2),
             file_name=get_report_filename(product, mode, "json"),
-            mime="application/json", use_container_width=True)
+            mime="application/json", use_container_width=True, key=f"dl_json_{_sfx}")
 
 
 def _rate_guard() -> bool:
@@ -816,6 +818,8 @@ def page_trade_analysis(records: list) -> None:
     st.markdown(f"### ✅ Analysis Complete &nbsp; {conf_label}", unsafe_allow_html=True)
     if result.get("validation_warning"):
         st.warning(f"⚠️ {result['validation_warning']}")
+    if result.get("state_specific_note"):
+        st.info(f"📍 **State/Region Context:** {result['state_specific_note']}")
 
     if mode == "Import":
         c1, c2, c3, c4 = st.columns(4)
@@ -877,7 +881,17 @@ def page_trade_analysis(records: list) -> None:
         if result.get("risk_flags") and result["risk_flags"] not in (None, "null", "none", "None", ""):
             st.error(f"🚨 **Risk Flags:** {result['risk_flags']}")
 
-    with st.expander("📋 Full JSON Response"):
+    # Plain English Summary
+    if result.get("plain_summary"):
+        st.markdown("---")
+        st.markdown(f"""<div style="background:#0d2040;border:1px solid #1a6fa8;border-radius:12px;
+            padding:16px 20px;margin:8px 0;">
+          <div style="color:#63b3ed;font-size:0.75rem;font-weight:700;margin-bottom:6px;">🤖 AI SUMMARY</div>
+          <div style="color:#e2e8f0;font-size:0.92rem;line-height:1.6;">{result["plain_summary"]}</div>
+        </div>""", unsafe_allow_html=True)
+    if result.get("state_specific_note"):
+        st.info(f"📍 **State/Region Note:** {result['state_specific_note']}")
+    with st.expander("📋 Full Details (Technical JSON)"):
         st.json(result)
     st.markdown("---")
     _download_row(result, product, mode, user["email"])
@@ -897,14 +911,12 @@ def page_trade_analysis(records: list) -> None:
 # ════════════════════════════════════════════════════════════════════
 def page_document_analyzer() -> None:
     user = st.session_state.user
-    page_header("Document Analyzer",
-                "AI-powered scanning, extraction & validation of trade documents", "📄")
+    page_header("Document Analyzer", "AI-powered scanning, extraction & validation of trade documents", "📄")
     if not _rate_guard():
         return
- 
+
     sub = st.tabs(["📋 Paste Text", "📤 Upload & Scan (OCR)"])
- 
-    # ── Tab 1: Paste Text ─────────────────────────────────────────
+
     with sub[0]:
         c1, c2 = st.columns([3, 1])
         with c1:
@@ -912,13 +924,11 @@ def page_document_analyzer() -> None:
                 placeholder="Paste a Commercial Invoice, Packing List, Bill of Lading...",
                 key="doc_text_input")
         with c2:
-            doc_type = st.selectbox("Document Type",
-                ["auto","Commercial Invoice","Packing List","Bill of Lading",
-                 "Bill of Entry","Shipping Bill","Certificate of Origin","Letter of Credit"],
-                key="doc_type_sel")
+            doc_type = st.selectbox("Document Type", ["auto", "Commercial Invoice", "Packing List",
+                "Bill of Lading", "Bill of Entry", "Shipping Bill",
+                "Certificate of Origin", "Letter of Credit"], key="doc_type_sel")
             st.markdown("<br>", unsafe_allow_html=True)
-            run_doc = st.button("📄 Analyze", type="primary",
-                                use_container_width=True, key="doc_paste_btn")
+            run_doc = st.button("📄 Analyze", type="primary", use_container_width=True, key="doc_paste_btn")
         if run_doc:
             if not doc_text.strip():
                 st.warning("Please paste document text.")
@@ -929,38 +939,32 @@ def page_document_analyzer() -> None:
                 log_trade_usage(user_id=user["id"], email=user["email"],
                                 mode="Doc-Analyze", product=f"Document: {doc_type}", result=result)
                 st.session_state.doc_result = result
-                st.rerun()
- 
-    # ── Tab 2: Upload & OCR ───────────────────────────────────────
+                if "error" not in result:
+                    st.rerun()
+
     with sub[1]:
         st.markdown("""
         <div class="highlight-card" style="margin-bottom:16px;">
-          <h4 style="color:#63b3ed;margin:0 0 6px;">🔍 Document Scanner</h4>
+          <h4 style="color:#63b3ed;margin:0 0 6px;">🔍 Document Scanner Pipeline</h4>
           <p style="color:#8b949e;margin:0;font-size:0.85rem;">
             Upload trade documents → OCR extracts text → AI analyzes.<br>
-            <strong>For native PDFs</strong> (with selectable text): works immediately.<br>
-            <strong>For scanned/image PDFs</strong>: requires Tesseract — see OCR_SETUP_COMMANDS.md
+            <strong>Multiple files supported</strong> — each file counts as 1 query.
           </p>
         </div>
         """, unsafe_allow_html=True)
- 
         col1, col2 = st.columns([2, 1])
         with col1:
-            uploaded_files = st.file_uploader(
-                "Upload documents (multi-file supported)",
-                type=["pdf","png","jpg","jpeg"],
-                accept_multiple_files=True, key="doc_upload")
+            uploaded_files = st.file_uploader("Upload documents (multi-file supported)",
+                type=["pdf", "png", "jpg", "jpeg"], accept_multiple_files=True, key="doc_upload")
         with col2:
-            ocr_doc_type = st.selectbox("Document Type",
-                ["auto","Commercial Invoice","Packing List","Bill of Lading",
-                 "Bill of Entry","Shipping Bill","Certificate of Origin","Letter of Credit"],
-                key="ocr_doc_type")
+            ocr_doc_type = st.selectbox("Document Type", ["auto", "Commercial Invoice", "Packing List",
+                "Bill of Lading", "Bill of Entry", "Shipping Bill",
+                "Certificate of Origin", "Letter of Credit"], key="ocr_doc_type")
             enhance   = st.checkbox("🔧 Enhance image quality", value=True)
-            force_ocr = st.checkbox("🔄 Force OCR (for scanned PDFs)", value=False)
+            force_ocr = st.checkbox("🔄 Force OCR (skip text extraction)", value=False)
             st.markdown("<br>", unsafe_allow_html=True)
-            run_ocr = st.button("🔍 Scan & Analyze", type="primary",
-                                use_container_width=True, key="doc_ocr_btn")
- 
+            run_ocr = st.button("🔍 Scan & Analyze", type="primary", use_container_width=True, key="doc_ocr_btn")
+
         if run_ocr:
             if not uploaded_files:
                 st.warning("Please upload at least one document file.")
@@ -969,65 +973,49 @@ def page_document_analyzer() -> None:
                 for uploaded_file in uploaded_files:
                     st.markdown(f"**Processing: {uploaded_file.name}**")
                     file_bytes = uploaded_file.read()
- 
-                    with st.spinner(f"📖 Scanning {uploaded_file.name}..."):
-                        scan_result = scan_document(
-                            file_bytes, uploaded_file.name,
-                            enhance=enhance,
-                            force_ocr=force_ocr and uploaded_file.name.lower().endswith(".pdf"),
-                        )
- 
+                    if force_ocr and uploaded_file.name.lower().endswith(".pdf"):
+                        with st.spinner(f"📖 Force-OCR: {uploaded_file.name}..."):
+                            scan_result = scan_document(file_bytes, uploaded_file.name, enhance=enhance, force_ocr=True)
+                    else:
+                        with st.spinner(f"📖 Scanning {uploaded_file.name}..."):
+                            scan_result = scan_document(file_bytes, uploaded_file.name, enhance=enhance)
+
                     if scan_result["status"] == "error":
-                        msg = scan_result.get("message","Unknown error")
+                        msg = scan_result.get("message", "Unknown error")
                         st.error(f"❌ {uploaded_file.name}: {msg}")
-                        is_tess = "Tesseract" in msg or "tesseract" in msg
-                        if is_tess:
-                            with st.expander("📋 Tesseract Install Guide", expanded=True):
+                        if "Tesseract" in msg or "tesseract" in msg:
+                            with st.expander("📋 How to fix — Tesseract Install Guide", expanded=True):
                                 st.markdown("""
-**Install Tesseract binary (required for scanned PDFs and images):**
- 
-- **Windows:** https://github.com/UB-Mannheim/tesseract/wiki  
-  Download `tesseract-ocr-w64-setup-5.x.x.exe` → run → tick **Add to PATH** → restart VS Code terminal  
-  Or add to `.env`: `TESSERACT_CMD=C:\\Program Files\\Tesseract-OCR\\tesseract.exe`
- 
+**`pip install pytesseract` only installs the Python wrapper — NOT the OCR engine.**
+
+- **Windows:** Download from [UB-Mannheim](https://github.com/UB-Mannheim/tesseract/wiki) → run `.exe` → tick Add to PATH → restart terminal
 - **Ubuntu/WSL:** `sudo apt-get install tesseract-ocr tesseract-ocr-eng`
 - **macOS:** `brew install tesseract`
- 
-Then run: `tesseract --version` to verify. Restart app after install.
- 
-**For native PDFs** (not scanned): Tesseract is NOT needed — these extract text directly.
+
+Add to `.env` if PATH still fails: `TESSERACT_CMD=C:\\Program Files\\Tesseract-OCR\\tesseract.exe`
 """)
                             break
                         elif scan_result.get("install_hint"):
                             st.info(scan_result["install_hint"])
                         continue
- 
+
                     extracted_text = scan_result["text"]
-                    st.success(
-                        f"✅ {uploaded_file.name}: "
-                        f"{scan_result['char_count']:,} chars extracted from "
-                        f"{scan_result['pages']} page(s) via {scan_result.get('method','text')}"
-                    )
-                    with st.expander(f"👁️ Preview extracted text — {uploaded_file.name}"):
-                        st.text_area("Extracted text", value=extracted_text[:3000],
-                                     height=150, disabled=True,
-                                     key=f"ocr_prev_{uploaded_file.name}")
- 
+                    st.success(f"✅ {uploaded_file.name}: {scan_result['char_count']:,} chars from {scan_result['pages']} page(s) via {scan_result.get('method','OCR')}")
+                    with st.expander(f"👁️ Preview: {uploaded_file.name}"):
+                        st.text_area("Extracted text (read-only)", value=extracted_text[:3000],
+                                     height=150, disabled=True, key=f"ocr_prev_{uploaded_file.name}")
                     if extracted_text.strip():
-                        with st.spinner(f"🤖 Analyzing with AI — {uploaded_file.name}..."):
+                        with st.spinner(f"🤖 Analyzing {uploaded_file.name}..."):
                             doc_result = analyze_trade_document(extracted_text, ocr_doc_type)
                         _consume_and_refresh(user["id"])
-                        log_trade_usage(
-                            user_id=user["id"], email=user["email"],
-                            mode="Doc-Scan-Analyze",
-                            product=f"Scanned: {uploaded_file.name}", result=doc_result)
+                        log_trade_usage(user_id=user["id"], email=user["email"],
+                                        mode="Doc-Scan-Analyze",
+                                        product=f"Scanned: {uploaded_file.name}", result=doc_result)
                         doc_result["_filename"] = uploaded_file.name
                         all_doc_results.append(doc_result)
                     else:
-                        st.warning(
-                            f"⚠️ {uploaded_file.name}: OCR returned empty text. "
-                            f"Try enabling 'Force OCR' if this is a scanned PDF.")
- 
+                        st.warning(f"⚠️ {uploaded_file.name}: OCR produced empty text. Try Force OCR.")
+
                 if all_doc_results:
                     st.session_state.doc_result = all_doc_results[-1]
                     if len(all_doc_results) > 1:
@@ -1037,106 +1025,128 @@ Then run: `tesseract --version` to verify. Restart app after install.
                             with st.expander(f"📄 {fname} result"):
                                 st.json(dr)
                     st.rerun()
- 
-    # ══════════════════════════════════════════════════════════════
-    # RESULT SECTION — renders after rerun for both tabs
-    # ══════════════════════════════════════════════════════════════
+
     result = st.session_state.doc_result
     if not result:
         return
- 
+    if "error" in result:
+        st.error(f"❌ AI Error: {result['error']}")
+        with st.expander("Raw response"): st.json(result)
+        return
+
     st.markdown("---")
     st.markdown("### 📋 Analysis Result")
- 
-    # ── Show error but also try to render whatever we have ────────
-    if "error" in result:
-        st.error(f"❌ AI Analysis Error: {result['error']}")
-        # Don't return — show raw JSON so user can still see something
-        st.markdown("**Raw response:**")
-        st.json(result)
-        return
- 
-    # ── Compliance status banner ───────────────────────────────────
-    status = (result.get("compliance_status") or "OK").strip()
-    doc_type_name = result.get("document_type") or result.get("_filename") or "Document"
-    if status in ("OK", "CLEAR"):
-        st.success(f"✅ **{doc_type_name}** · Compliance Status: {status}")
-    elif status in ("Review Needed", "CONDITIONAL", "REVIEW"):
-        st.warning(f"⚠️ **{doc_type_name}** · Status: {status}")
+
+    # Compliance status banner
+    status   = (result.get("compliance_status") or "OK").strip()
+    doc_name = result.get("document_type") or result.get("_filename") or "Document"
+    if status in ("OK","CLEAR"):
+        st.success(f"✅ **{doc_name}** — Compliance Status: {status}")
+    elif status in ("Review Needed","CONDITIONAL","REVIEW"):
+        st.warning(f"⚠️ **{doc_name}** — Status: {status}")
     else:
-        st.error(f"❌ **{doc_type_name}** · Status: {status}")
- 
-    # ── Key fields row ─────────────────────────────────────────────
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Doc Number", result.get("document_number") or "—")
-    c2.metric("Doc Date",   result.get("document_date")   or "—")
-    c3.metric("Incoterm",   result.get("incoterm")         or "—")
+        st.info(f"ℹ️ **{doc_name}** — Status: {status}")
+
+    # AI plain English verdict
+    notes = (result.get("compliance_notes") or "").strip()
+    if notes:
+        st.markdown(f"""<div style="background:#0d2040;border:1px solid #1a6fa8;
+            border-radius:12px;padding:16px 20px;margin:8px 0;">
+          <div style="color:#63b3ed;font-size:0.75rem;font-weight:700;margin-bottom:6px;">🤖 AI ASSESSMENT</div>
+          <div style="color:#e2e8f0;font-size:0.92rem;line-height:1.6;">{notes}</div></div>""",
+            unsafe_allow_html=True)
+
+    # Filter placeholder strings
+    def _real(v):
+        if v is None: return None
+        s = str(v).strip()
+        if s.lower() in ("null","none","n/a","","number or null","date or null",
+                         "fob/cif/etc or null","incoterm or null","unknown"): return None
+        return s
+
+    # Key fields
+    doc_num  = _real(result.get("document_number"))
+    doc_date = _real(result.get("document_date"))
+    incoterm = _real(result.get("incoterm"))
     tv = result.get("total_invoice_value") or {}
     if isinstance(tv, dict):
-        amt = tv.get("amount", 0) or 0
-        cur = tv.get("currency", "USD") or "USD"
-        c4.metric("Total Value", f"{cur} {float(amt):,.2f}" if amt else "—")
+        amt = tv.get("amount") or 0
+        cur = tv.get("currency") or "USD"
+        try:    total_val = f"{cur} {float(amt):,.2f}" if float(amt) > 0 else None
+        except: total_val = _real(str(amt))
     else:
-        c4.metric("Total Value", str(tv) if tv else "—")
- 
-    # ── Exporter / Importer ────────────────────────────────────────
+        total_val = _real(str(tv))
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Doc Number",  doc_num   or "—")
+    c2.metric("Doc Date",    doc_date  or "—")
+    c3.metric("Incoterm",    incoterm  or "—")
+    c4.metric("Total Value", total_val or "—")
+    if not any([doc_num, doc_date, incoterm, total_val]):
+        st.caption("ℹ️ Header fields not found — they may not appear in this document type.")
+
+    # Parties — handle new schema (exporter.name) AND old schema (parties.exporter)
+    parties = result.get("parties") or {}
     exp = result.get("exporter") or {}
     imp = result.get("importer") or {}
-    if isinstance(exp, dict) and isinstance(imp, dict):
-        if exp.get("name") or imp.get("name"):
-            ec1, ec2 = st.columns(2)
-            if exp.get("name"):
-                ec1.markdown(f"**Exporter:** {exp['name']}"
-                             + (f" · IEC: `{exp['iec_code']}`" if exp.get("iec_code") else ""))
-            if imp.get("name"):
-                ec2.markdown(f"**Importer:** {imp['name']} · {imp.get('country','')}")
- 
-    # ── Products table ────────────────────────────────────────────
+    if isinstance(exp, str): exp = {"name": exp}
+    if isinstance(imp, str): imp = {"name": imp}
+    if not exp.get("name") and parties.get("exporter"):
+        exp = {"name": parties["exporter"]}
+    if not imp.get("name") and parties.get("importer"):
+        imp = {"name": parties["importer"], "country": parties.get("destination_country","")}
+
+    exp_name = _real(exp.get("name")); imp_name = _real(imp.get("name"))
+    if exp_name or imp_name:
+        ec1, ec2 = st.columns(2)
+        if exp_name:
+            ec1.markdown("**Exporter/Seller:** " + exp_name +
+                         (f" · IEC: `{exp['iec_code']}`" if _real(exp.get("iec_code")) else ""))
+        if imp_name:
+            ec2.markdown("**Importer/Buyer:** " + imp_name +
+                         (f" · {_real(imp.get('country',''))}" if _real(imp.get("country")) else ""))
+
+    # Products — handle new schema AND old product_details schema
     products = result.get("products") or []
+    if not products:
+        pd_raw = result.get("product_details") or {}
+        if isinstance(pd_raw, dict) and pd_raw.get("description"):
+            products = [{"description": pd_raw.get("description",""),
+                         "hs_code": pd_raw.get("hs_code"),
+                         "quantity": str(pd_raw.get("quantity","")),
+                         "unit_price_usd": 0, "total_value_usd": 0}]
+
     if products and isinstance(products, list):
-        st.markdown("**📦 Product Lines:**")
-        df_data = []
+        st.markdown("**📦 Products / Line Items:**")
+        rows = []
         for p in products:
             if isinstance(p, dict):
-                df_data.append({
-                    "Line":       p.get("line_no", ""),
-                    "Description":p.get("description", "")[:60],
-                    "HS Code":    p.get("hs_code") or "—",
-                    "✓":          "✅" if p.get("hs_code_valid") else "⚠️",
-                    "Qty":        f"{p.get('quantity','')} {p.get('unit','')}".strip(),
-                    "Unit Price": f"${p.get('unit_price_usd',0):,.2f}",
-                    "Total":      f"${p.get('total_value_usd',0):,.2f}",
+                desc = _real(p.get("description")) or "—"
+                rows.append({
+                    "Description": desc[:70],
+                    "HS Code":     _real(p.get("hs_code")) or "—",
+                    "Qty":         f"{p.get('quantity','')} {p.get('unit','')}".strip() or "—",
+                    "Unit Price":  f"${float(p.get('unit_price_usd') or 0):,.2f}",
+                    "Total":       f"${float(p.get('total_value_usd') or 0):,.2f}",
+                    "HS Valid":    "✅" if p.get("hs_code_valid") else "⚠️",
                 })
-        if df_data:
-            st.dataframe(pd.DataFrame(df_data), use_container_width=True, hide_index=True)
- 
-    # ── Flags and missing fields ───────────────────────────────────
-    flags   = result.get("flags") or []
-    missing = result.get("missing_critical_fields") or []
-    if flags:
-        st.warning("**⚠️ Flags:**\n" + "\n".join(f"- {f}" for f in flags))
-    if missing:
-        st.error("**❌ Missing critical fields:**\n" + "\n".join(f"- {m}" for m in missing))
- 
-    notes = result.get("compliance_notes") or ""
-    if notes:
-        st.info(f"**Notes:** {notes}")
- 
-    # ── If result has data but none of the above fields rendered,
-    #    show a structured fallback so the user always sees SOMETHING
-    structured_keys = {"document_type","compliance_status","document_number",
-                       "document_date","exporter","importer","products",
-                       "total_invoice_value","incoterm"}
-    result_keys = set(result.keys()) - {"_filename","error"}
-    has_structured = bool(result_keys & structured_keys)
- 
-    if not has_structured or len([k for k in result_keys if k not in {"data_confidence"}]) < 3:
-        st.info("ℹ️ The AI returned a partial response. Full details below:")
- 
-    with st.expander("📋 Full AI Response (JSON)"):
+        if rows:
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+    # Flags, missing, recommendations
+    flags          = result.get("flags") or result.get("compliance_flags") or []
+    missing        = result.get("missing_critical_fields") or result.get("missing_information") or []
+    recommendations= result.get("recommendations") or []
+    risk_alerts    = result.get("risk_alerts") or []
+
+    if flags:            st.warning("**⚠️ Flags:**\n"        + "\n".join(f"- {f}" for f in flags           if f))
+    if missing:          st.error("**❌ Missing Fields:**\n"  + "\n".join(f"- {m}" for m in missing         if m))
+    if risk_alerts:      st.error("**🚨 Risk Alerts:**\n"     + "\n".join(f"- {a}" for a in risk_alerts     if a))
+    if recommendations:  st.info("**💡 Recommendations:**\n" + "\n".join(f"- {r}" for r in recommendations  if r))
+
+    with st.expander("📋 Full Technical Details (JSON)"):
         st.json(result)
- 
-    _download_row(result, doc_type_name, "Doc-Analyze", user["email"])
+    _download_row(result, doc_name, "Doc-Analyze", user["email"])
 
 # ════════════════════════════════════════════════════════════════════
 # PAGE: PROFILE
@@ -1476,7 +1486,14 @@ def page_risk_analyzer() -> None:
     </div>""", unsafe_allow_html=True)
 
     summary = result.get("executive_summary", "")
-    if summary: st.info(f"📋 **Summary:** {summary}")
+    plain   = result.get("plain_summary", "")
+    if plain:
+        st.markdown(f"""<div style="background:#0d2040;border:1px solid #1a6fa8;
+            border-radius:12px;padding:16px 20px;margin:8px 0;">
+          <div style="color:#63b3ed;font-size:0.75rem;font-weight:700;margin-bottom:6px;">🤖 AI SUMMARY</div>
+          <div style="color:#e2e8f0;font-size:0.92rem;line-height:1.6;">{plain}</div></div>""",
+            unsafe_allow_html=True)
+    elif summary: st.info(f"📋 **Summary:** {summary}")
 
     categories = result.get("risk_categories", [])
     cat_icons = {"Regulatory & Sanctions": "📜", "Geopolitical Risk": "🌐",
@@ -1543,22 +1560,24 @@ def page_risk_analyzer() -> None:
         if insurance:   c2.info(f"**🛡️ Insurance:** {insurance}")
     if result.get("recommended_incoterm"): st.info(f"**Incoterm:** {result.get('recommended_incoterm')}")
     if result.get("fta_applicable"):       st.success(f"🤝 FTA Benefit: {result.get('fta_detail','')}")
+    if result.get("state_port_advice"):    st.info(f"📍 **Port/State Advice:** {result['state_port_advice']}")
     _download_row(result, product.strip() if product.strip() else "product", "Risk-Analysis", user["email"])
 
 # ════════════════════════════════════════════════════════════════════
 # PAGE: PRICE INTELLIGENCE
 # ════════════════════════════════════════════════════════════════════
 def page_price_intelligence() -> None:
-     user = st.session_state.user                       # ← defined HERE, first line
-     page_header("Global Price Intelligence",
+    user = st.session_state.user
+    page_header("Global Price Intelligence",
                 "Benchmark your product price against global markets", "💰")
-     if not _rate_guard():
+    if not _rate_guard():
         return
-     c1, c2, c3 = st.columns(3)
-     with c1: product = st.text_input("📦 Product", placeholder="Turmeric powder", key="price_prod")
-     with c2: qty     = st.text_input("Quantity Basis", value="1 MT", key="price_qty")
-     with c3: market  = st.text_input("Target Market", value="Global", key="price_mkt")
-     if st.button("💰 Get Price Intelligence", type="primary", use_container_width=True, key="price_btn"):
+    c1, c2, c3 = st.columns(3)
+    with c1: product = st.text_input("📦 Product", placeholder="Turmeric powder", key="price_prod")
+    with c2: qty     = st.text_input("Quantity Basis", value="1 MT", key="price_qty")
+    with c3: market  = st.text_input("Target Market", value="Global", key="price_mkt")
+
+    if st.button("💰 Get Price Intelligence", type="primary", use_container_width=True, key="price_btn"):
         if not product.strip():
             st.warning("Enter a product.")
         else:
@@ -1570,150 +1589,117 @@ def page_price_intelligence() -> None:
             st.session_state.price_result = result
             if "error" not in result:
                 st.rerun()
-     result = st.session_state.price_result
-     if not result:
+
+    result = st.session_state.price_result
+    if not result:
         return
-     if "error" in result:
+    if "error" in result:
         st.error(f"❌ {result['error']}")
         return
- 
-    # ── Helper: safely pull a number from a nested dict OR a bare number ──
-     def _n(obj, *keys, default=0):
-        """Try keys in order; also handles flat number responses from LLM."""
-        if isinstance(obj, (int, float)):
-            return obj
-        if isinstance(obj, dict):
-            for k in keys:
-                v = obj.get(k)
-                if v is not None and v != 0:
+
+    import re as _re2
+
+    def _extract_num(val) -> float:
+        """Pull number from: int/float, nested dict (typical/min/max), or string."""
+        if isinstance(val, (int, float)) and val != 0:
+            return float(val)
+        if isinstance(val, dict):
+            for k in ("typical", "min", "max", "value"):
+                v = val.get(k)
+                if v is not None:
                     try:
-                        return float(v)
-                    except (TypeError, ValueError):
+                        n = float(str(v).replace(",","").replace("$","").replace("₹","").strip())
+                        if n != 0: return n
+                    except Exception:
                         pass
-        return default
- 
-     fob = result.get("india_fob_price_usd", {})
-     dom = result.get("india_domestic_price_inr", {})
-     lnd = result.get("target_market_landed_usd", {})
-     mgn = result.get("gross_margin_pct", {})
- 
-     fob_val = _n(fob, "typical", "min", "max")
-     dom_val = _n(dom, "typical", "min", "max")
-     lnd_val = _n(lnd, "typical", "min", "max")
-     mgn_min = _n(mgn, "min", "typical") if isinstance(mgn, dict) else _n(mgn)
-     mgn_max = _n(mgn, "max", "typical") if isinstance(mgn, dict) else _n(mgn)
-     fob_unit = fob.get("unit", "") if isinstance(fob, dict) else ""
- 
-     def _fmt_usd(v): return f"${v:,.0f} {fob_unit}".strip() if v else "—"
-     def _fmt_inr(v): return f"₹{v:,.0f}".strip() if v else "—"
- 
-     c1, c2, c3, c4 = st.columns(4)
-     c1.metric("India FOB",      _fmt_usd(fob_val))
-     c2.metric("Domestic Price", _fmt_inr(dom_val))
-     c3.metric("Market Landed",  _fmt_usd(lnd_val))
-     c4.metric("Gross Margin",   f"{int(mgn_min)}–{int(mgn_max)}%" if (mgn_min or mgn_max) else "—")
- 
-     trend = result.get("global_price_trend", "Stable")
-     trend_color = {"Rising":"#48bb78","Falling":"#fc8181","Stable":"#ecc94b"}.get(trend,"#a0aec0")
-     st.markdown(
-        f'<div class="info-card"><span style="color:{trend_color};font-weight:700;">'
-        f'{trend} Trend</span> — {result.get("trend_reason","")}</div>',
+        if isinstance(val, str) and val.strip():
+            nums = _re2.findall(r"[\d]+\.?[\d]*", val.replace(",",""))
+            for n in nums:
+                try:
+                    v = float(n)
+                    if v > 0: return v
+                except Exception:
+                    pass
+        return 0.0
+
+    def _unit(obj) -> str:
+        return obj.get("unit","") if isinstance(obj, dict) else ""
+
+    # Flat top-level fields (new nvidia_service format) take priority
+    fob_val  = _extract_num(result.get("fob_usd") or result.get("india_fob_price_usd") or result.get("fob_india_price_usd", 0))
+    dom_val  = _extract_num(result.get("dom_inr") or result.get("india_domestic_price_inr", 0))
+    lnd_val  = _extract_num(result.get("landed_usd") or result.get("target_market_landed_usd") or result.get("cif_destination_usd", 0))
+    price_unit = result.get("price_unit") or _unit(result.get("india_fob_price_usd",{})) or ""
+
+    mgn_raw = result.get("gross_margin_pct") or {}
+    if isinstance(mgn_raw, dict):
+        mgn_min = _extract_num(mgn_raw.get("min",0)); mgn_max = _extract_num(mgn_raw.get("max",0))
+    elif isinstance(mgn_raw,(int,float)):
+        mgn_min = mgn_max = float(mgn_raw)
+    else:
+        m_str = str(mgn_raw).replace("%","").replace("−","-").strip()
+        parts = [p.strip() for p in m_str.replace("–","-").split("-") if p.strip()]
+        try: mgn_min = float(parts[0])
+        except: mgn_min = 0.0
+        try: mgn_max = float(parts[-1])
+        except: mgn_max = mgn_min
+    # Also check flat fields from new format
+    if not mgn_min: mgn_min = _extract_num(result.get("margin_min_pct",0))
+    if not mgn_max: mgn_max = _extract_num(result.get("margin_max_pct",0))
+
+    def _fmt_usd(v): return f"${v:,.0f} {price_unit}".strip() if v else "—"
+    def _fmt_inr(v): return f"₹{v:,.0f}".strip() if v else "—"
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("India FOB",      _fmt_usd(fob_val))
+    c2.metric("Domestic Price", _fmt_inr(dom_val))
+    c3.metric("Market Landed",  _fmt_usd(lnd_val))
+    c4.metric("Gross Margin",   f"{int(mgn_min)}–{int(mgn_max)}%" if (mgn_min or mgn_max) else
+              result.get("margin_estimate_pct","—"))
+
+    trend = result.get("global_price_trend") or result.get("price_trend_6m","Stable")
+    trend_reason = result.get("trend_reason") or result.get("price_trend_details","")
+    trend_color = {"Rising":"#48bb78","Falling":"#fc8181","Stable":"#ecc94b"}.get(trend,"#a0aec0")
+    st.markdown(
+        f'<div class="info-card"><span style="color:{trend_color};font-weight:700;">' +
+        f'{trend} Trend</span> — {trend_reason}</div>',
         unsafe_allow_html=True)
-     advantage = result.get("india_price_advantage","")
-     if advantage:
-        st.info(f"📌 **India's Position:** {advantage}")
- 
-     comp_prices = result.get("competitor_prices", [])
-     if comp_prices:
+
+    advantage = result.get("india_price_advantage") or result.get("india_competitiveness","")
+    if advantage:
+        st.info(f"📌 **India\'s Position:** {advantage}")
+
+    comp_prices = result.get("competitor_prices",[])
+    if comp_prices:
         st.markdown("**🌍 Competitor Prices:**")
         for cp in comp_prices:
             if isinstance(cp, dict):
-                st.markdown(f"- **{cp.get('country','')}**: {cp.get('price_usd_per_unit','N/A')} — {cp.get('quality_note','')}")
- 
-     drivers = result.get("key_price_drivers", [])
-     if drivers:
-        st.markdown("**📈 Key Price Drivers:** " + " · ".join(drivers))
- 
-     if result.get("pricing_strategy"):
+                price_v = cp.get("price_usd_per_unit") or cp.get("price_usd","N/A")
+                if isinstance(price_v,(int,float)): price_v = f"${price_v:,.0f}"
+                st.markdown(f"- **{cp.get('country','')}**: {price_v} — {cp.get('quality_note','')}")
+
+    drivers = result.get("key_price_drivers",[])
+    if drivers:
+        st.markdown("**📈 Key Price Drivers:** " + " · ".join(str(d) for d in drivers))
+
+    if result.get("pricing_strategy"):
         st.info(f"💡 **Pricing Strategy:** {result['pricing_strategy']}")
- 
-     st.warning(result.get("data_note", "Indicative 2024 price estimates. Verify with real quotes before trading."))
-     _download_row(result, product.strip(), "Price-Intel", user["email"])
-    # ── Robust field extraction — handles both nested dict and flat string schemas ──
-     def _price_val(field, fallback_fields=None, default="—"):
-        """Extract price value from nested dict OR flat string field."""
-        v = result.get(field)
-        if isinstance(v, dict):
-            typical = v.get("typical") or v.get("value") or v.get("min")
-            unit    = v.get("unit", "")
-            if typical and typical != 0:
-                return str(typical), unit
-        elif v and str(v).strip() not in ("0", "0.0", "", "None", "null"):
-            return str(v), ""
-        # Try fallback field names
-        for fb in (fallback_fields or []):
-            fbv = result.get(fb)
-            if fbv and str(fbv).strip() not in ("0", "0.0", "", "None", "null"):
-                return str(fbv), ""
-        return default, ""
 
-     fob_val, fob_unit = _price_val("india_fob_price_usd", ["fob_india_price_usd"])
-     dom_val, dom_unit = _price_val("india_domestic_price_inr")
-     lnd_val, lnd_unit = _price_val("target_market_landed_usd", ["cif_destination_usd"])
-
-     mgn = result.get("gross_margin_pct", {})
-     if isinstance(mgn, dict):
-        mgn_min = mgn.get("min", "—"); mgn_max = mgn.get("max", "—")
-        margin_str = f"{mgn_min}–{mgn_max}%"
-     elif isinstance(mgn, str) and mgn not in ("0", "", "null"):
-        margin_str = mgn if "%" in mgn else mgn + "%"
-     else:
-        margin_str = result.get("margin_estimate_pct", "—")
-
-     c1, c2, c3, c4 = st.columns(4)
-     c1.metric("India FOB",      f"${fob_val} {fob_unit}".strip())
-     c2.metric("Domestic Price", f"₹{dom_val} {dom_unit}".strip())
-     c3.metric("Market Landed",  f"${lnd_val} {lnd_unit}".strip())
-     c4.metric("Gross Margin",   margin_str)
-
-    # Trend — handle both "global_price_trend" and "price_trend_6m"
-     trend = result.get("global_price_trend") or result.get("price_trend_6m", "Stable")
-     trend_reason = result.get("trend_reason") or result.get("price_trend_details", "")
-     trend_color = {"Rising": "#48bb78", "Falling": "#fc8181", "Stable": "#ecc94b"}.get(trend, "#a0aec0")
-     st.markdown(f"""<div class="info-card"><span style="color:{trend_color};font-weight:700;">
-      {trend} Trend</span> — {trend_reason}</div>""", unsafe_allow_html=True)
-
-     advantage = result.get("india_price_advantage") or result.get("india_competitiveness", "")
-     if advantage:
-        st.info(f"📌 **India's Position:** {advantage}")
-
-    # Competitor prices table if present
-     comp_prices = result.get("competitor_prices", [])
-     if comp_prices:
-        st.markdown("**🌍 Competitor Prices:**")
-        for cp in comp_prices:
-            country = cp.get("country", "")
-            price   = cp.get("price_usd_per_unit") or cp.get("price_usd", "—")
-            note    = cp.get("quality_note", "")
-            st.markdown(f"- **{country}:** {price}" + (f" — {note}" if note else ""))
-
-     strategy = result.get("pricing_strategy", "")
-     if strategy:
-        st.success(f"💡 **Pricing Strategy:** {strategy}")
-
-     st.warning(f"⚠️ {result.get('data_note', 'Indicative price estimates. Verify with real market quotes before trading.')}")
-     _download_row(result, product.strip() if product.strip() else "product", "Price-Intel", user["email"])
-
-# ════════════════════════════════════════════════════════════════════
-# PAGE: COMPLIANCE CHECKER
-# ════════════════════════════════════════════════════════════════════
+    plain_p = result.get("plain_summary","")
+    if plain_p:
+        st.markdown(f"""<div style="background:#0d2040;border:1px solid #1a6fa8;
+            border-radius:12px;padding:16px 20px;margin:8px 0;">
+          <div style="color:#63b3ed;font-size:0.75rem;font-weight:700;margin-bottom:6px;">🤖 AI SUMMARY</div>
+          <div style="color:#e2e8f0;font-size:0.92rem;line-height:1.6;">{plain_p}</div></div>""",
+            unsafe_allow_html=True)
+    state_adv = result.get("state_advantage","")
+    if state_adv: st.info(f"📍 **State Advantage:** {state_adv}")
+    st.warning(result.get("data_note","⚠️ Indicative price estimates. Verify with real market quotes before trading."))
+    _download_row(result, product.strip(), "Price-Intel", user["email"])
 def page_compliance_checker() -> None:
     user = st.session_state.user
-    page_header("Trade Compliance Checker",
-                "SCOMET controls, DGFT policy, licences & documentation", "📋")
-    if not _rate_guard():
-        return
- 
+    page_header("Trade Compliance Checker", "SCOMET controls, DGFT policy, licences & documentation", "📋")
+    if not _rate_guard(): return
     c1, c2 = st.columns(2)
     with c1:
         product     = st.text_input("📦 Product", placeholder="Sodium cyanide 98%", key="comp_prod")
@@ -1721,8 +1707,7 @@ def page_compliance_checker() -> None:
     with c2:
         origin      = st.text_input("Origin Country", value="India", key="comp_orig")
         destination = st.text_input("Destination Country", placeholder="Germany", key="comp_dest")
-    direction = st.selectbox("Direction", ["Export","Import"], key="comp_dir")
- 
+    direction = st.selectbox("Direction", ["Export", "Import"], key="comp_dir")
     if st.button("📋 Check Compliance", type="primary", use_container_width=True, key="comp_btn"):
         if not product.strip() or not destination.strip():
             st.warning("Enter product and destination.")
@@ -1734,199 +1719,174 @@ def page_compliance_checker() -> None:
             log_trade_usage(user_id=user["id"], email=user["email"],
                             mode="Compliance", product=product.strip(), result=result)
             st.session_state.compliance_result = result
-            if "error" not in result:
-                st.rerun()
- 
+            if "error" not in result: st.rerun()
     result = st.session_state.compliance_result
-    if not result:
+    if not result or "error" in result:
+        if result and "error" in result: st.error(f"❌ {result['error']}")
         return
-    if "error" in result:
-        st.error(f"❌ {result['error']}")
-        return
- 
-    overall = result.get("overall_compliance_status","CLEAR")
-    summary = result.get("compliance_summary","")
+
+    # ── Overall status — handle both field name variants ──────────
+    overall = (result.get("overall_compliance_status")
+               or result.get("compliance_status", "CLEAR"))
+    # Normalise old schema values
+    status_map = {"Clear": "CLEAR", "Clear ": "CLEAR",
+                  "Review Required": "CONDITIONAL", "Action Needed": "BLOCKED"}
+    overall = status_map.get(overall, overall)
+    summary = result.get("compliance_summary") or result.get("compliance_summary", "")
+
     if overall == "CLEAR":         st.success(f"✅ **{overall}** — {summary}")
     elif overall == "CONDITIONAL": st.warning(f"⚠️ **{overall}** — {summary}")
     else:                          st.error(f"🚫 **{overall}** — {summary}")
- 
-    # checks can be a DICT (expected) or a LIST (LLM misformat) ────
+
+    # ── Checks — handle BOTH dict (new schema) and list (old schema) ──
     checks_raw = result.get("checks", {})
-    check_labels = {
-        "scomet_control":    "🔬 SCOMET",
-        "dgft_policy":       "📜 DGFT",
-        "un_sanctions":      "🌐 UN Sanctions",
-        "prohibited_items":  "🚫 Prohibited",
-        "licence_required":  "📄 Licence",
-        "quality_standards": "✅ Quality",
-    }
- 
-    if isinstance(checks_raw, dict):
-        cols = st.columns(3)
-        for i, (key, lbl) in enumerate(check_labels.items()):
-            chk = checks_raw.get(key, {})
-            s   = chk.get("status","—") if isinstance(chk, dict) else str(chk)
-            det = chk.get("detail","")  if isinstance(chk, dict) else ""
-            clr = ("#48bb78" if s in ("CLEAR","NOT REQUIRED","OK")
-                   else ("#fc8181" if s in ("BLOCKED","PROHIBITED") else "#ecc94b"))
-            with cols[i % 3]:
-                st.markdown(f"""<div class="info-card">
-                  <div style="font-weight:700;font-size:0.85rem;">{lbl}</div>
-                  <div style="color:{clr};font-weight:600;">{s}</div>
-                  <div style="font-size:0.75rem;color:#4a5568;">{det}</div>
-                </div>""", unsafe_allow_html=True)
- 
-    elif isinstance(checks_raw, list):
-        cols = st.columns(3)
-        for i, item in enumerate(checks_raw[:6]):
-            if isinstance(item, dict):
-                name = (item.get("category") or item.get("name") or
-                        item.get("check") or f"Check {i+1}")
-                s    = item.get("status","—")
-                det  = item.get("detail") or item.get("reason") or ""
-            else:
-                name, s, det = f"Check {i+1}", str(item), ""
-            clr = ("#48bb78" if s in ("CLEAR","NOT REQUIRED","OK")
-                   else ("#fc8181" if s in ("BLOCKED","PROHIBITED") else "#ecc94b"))
-            with cols[i % 3]:
-                st.markdown(f"""<div class="info-card">
-                  <div style="font-weight:700;font-size:0.85rem;">{name}</div>
-                  <div style="color:{clr};font-weight:600;">{s}</div>
-                  <div style="font-size:0.75rem;color:#4a5568;">{det}</div>
-                </div>""", unsafe_allow_html=True)
+    check_labels = {"scomet_control": "🔬 SCOMET", "dgft_policy": "📜 DGFT",
+                    "un_sanctions": "🌐 UN Sanctions", "prohibited_items": "🚫 Prohibited",
+                    "licence_required": "📄 Licence", "quality_standards": "✅ Quality"}
+
+    if isinstance(checks_raw, list):
+        # Old schema: [{"check": "Export License", "status": "Pass", "details": "..."}]
+        # Convert list to dict keyed by our standard keys using name mapping
+        list_to_key = {
+            "export license": "licence_required", "scomet": "scomet_control",
+            "sanctions": "un_sanctions", "documentation": "quality_standards",
+            "fta": "dgft_policy", "dgft": "dgft_policy", "prohibited": "prohibited_items",
+        }
+        checks_dict = {}
+        for item in checks_raw:
+            name   = item.get("check", "").lower()
+            status = item.get("status", "—")
+            detail = item.get("details", "")
+            # Map status values: Pass→CLEAR, Fail→BLOCKED, Check→REVIEW
+            status_norm = {"Pass": "CLEAR", "Fail": "BLOCKED", "Check": "REVIEW",
+                           "pass": "CLEAR", "fail": "BLOCKED"}.get(status, status)
+            for keyword, std_key in list_to_key.items():
+                if keyword in name and std_key not in checks_dict:
+                    checks_dict[std_key] = {"status": status_norm, "detail": detail}
+                    break
+        # Fill missing keys with CLEAR defaults
+        for k in check_labels:
+            if k not in checks_dict:
+                checks_dict[k] = {"status": "CLEAR", "detail": "No issues found"}
+        checks = checks_dict
+    elif isinstance(checks_raw, dict):
+        checks = checks_raw
     else:
-        st.info("Compliance check details not available.")
- 
+        checks = {}
+
+    cols = st.columns(3)
+    for i, (key, lbl) in enumerate(check_labels.items()):
+        chk = checks.get(key, {})
+        if not isinstance(chk, dict):
+            chk = {"status": str(chk), "detail": ""}
+        s   = chk.get("status", "—")
+        clr = "#48bb78" if s in ("CLEAR", "NOT REQUIRED", "OK") else ("#fc8181" if s == "BLOCKED" else "#ecc94b")
+        with cols[i % 3]:
+            st.markdown(f"""<div class="info-card">
+              <div style="font-weight:700;font-size:0.85rem;">{lbl}</div>
+              <div style="color:{clr};font-weight:600;">{s}</div>
+              <div style="font-size:0.75rem;color:#4a5568;">{chk.get('detail','')}</div>
+            </div>""", unsafe_allow_html=True)
     col1, col2 = st.columns(2)
     with col1:
         st.markdown("**📄 Required Documents**")
-        for d in result.get("required_documents",[]): st.markdown(f"- {d}")
+        for d in result.get("required_documents", []): st.markdown(f"- {d}")
     with col2:
         st.markdown("**🔜 Next Steps**")
-        for s in result.get("recommended_next_steps",[]): st.markdown(f"- {s}")
- 
-    duties = result.get("duties_estimate") or {}
-    if isinstance(duties, dict) and duties:
-        st.info(
-            f"**Duty Estimate** — BCD: {duties.get('bcd_pct','N/A')} · "
-            f"IGST: {duties.get('igst_pct','N/A')} · "
-            f"Total: {duties.get('total_duty_usd','N/A')}"
-        )
- 
-    _download_row(result, product.strip() if product.strip() else "product",
-                  "Compliance", user["email"])
+        for s in result.get("recommended_next_steps", []): st.markdown(f"- {s}")
+    _ps = result.get("plain_summary","")
+    if _ps:
+        st.markdown(f'<div style="background:#0d2040;border:1px solid #1a6fa8;border-radius:12px;padding:16px 20px;margin:8px 0;"><div style="color:#63b3ed;font-size:0.75rem;font-weight:700;margin-bottom:6px;">🤖 AI SUMMARY</div><div style="color:#e2e8f0;font-size:0.92rem;line-height:1.6;">{_ps}</div></div>', unsafe_allow_html=True)
+
+    _download_row(result, product.strip() if product.strip() else "product", "Compliance", user["email"])
 
 # ════════════════════════════════════════════════════════════════════
 # PAGE: COMPETITOR INTELLIGENCE
 # ════════════════════════════════════════════════════════════════════
 def page_competitor_intelligence() -> None:
     user = st.session_state.user
-    page_header("Competitor Intelligence",
-                "Analyze India's global competition — know your rivals", "🥊")
-    if not _rate_guard():
-        return
- 
+    page_header("Competitor Intelligence", "Analyze India's global competition — know your rivals", "🥊")
+    if not _rate_guard(): return
     c1, c2 = st.columns(2)
     with c1: product = st.text_input("📦 Product", placeholder="Basmati rice", key="comp_i_prod")
     with c2: market  = st.text_input("🌍 Target Market", placeholder="United States", key="comp_i_mkt")
- 
     if st.button("🥊 Analyze Competition", type="primary", use_container_width=True, key="comp_i_btn"):
         if not product.strip() or not market.strip():
             st.warning("Enter product and market.")
         else:
-            with st.spinner("📊 Analyzing competition..."):
+            with st.spinner("📊 Analyzing..."):
                 result = get_competitor_intelligence(product.strip(), market.strip())
             _consume_and_refresh(user["id"])
             log_trade_usage(user_id=user["id"], email=user["email"],
                             mode="Competitor-Intel", product=product.strip(), result=result)
             st.session_state.comp_result = result
-            if "error" not in result:
-                st.rerun()
- 
+            if "error" not in result: st.rerun()
     result = st.session_state.comp_result
-    if not result:
+    if not result or "error" in result:
+        if result and "error" in result: st.error(f"❌ {result['error']}")
         return
-    if "error" in result:
-        st.error(f"❌ {result['error']}")
-        return
- 
-    def _safe_pct(v):
-        try:
-            return f"{float(str(v).replace('%','').strip()):.1f}%"
-        except Exception:
-            return str(v) if v else "—"
- 
-    def _safe_num(v):
-        try:
-            return f"{float(str(v).replace(',','').replace('$','').replace('M','').strip()):,.0f}"
-        except Exception:
-            return str(v) if v else "—"
- 
-    share = result.get("india_market_share_pct") or result.get("india_current_market_share_pct", "—")
-    rank  = result.get("india_rank") or result.get("india_rank_in_market", "—")
-    size  = result.get("market_total_imports_usd_m", "—")
-    diff  = result.get("market_entry_difficulty", "Medium")
- 
+
+    # ── Safe numeric extraction (AI sometimes returns "15%" instead of 15) ──
+    def _num(v, default=0):
+        if v is None: return default
+        if isinstance(v, (int, float)): return v
+        s = str(v).replace("%", "").replace("$", "").replace(",", "").split()[0]
+        try: return float(s)
+        except: return default
+
+    share_pct = _num(result.get("india_market_share_pct") or result.get("india_current_market_share_pct"))
+    rank_val  = _num(result.get("india_rank") or result.get("india_rank_in_market"))
+    mkt_size  = _num(result.get("market_total_imports_usd_m"))
+
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("India's Share",    _safe_pct(share))
-    c2.metric("India's Rank",     f"#{rank}")
-    c3.metric("Market Size",      f"${_safe_num(size)}M" if size != "—" else "—")
-    c4.metric("Entry Difficulty", str(diff))
- 
+    c1.metric("India's Share",    f"{share_pct:.1f}%" if share_pct else "—")
+    c2.metric("India's Rank",     f"#{int(rank_val)}" if rank_val else "—")
+    c3.metric("Market Size",      f"${mkt_size:,.0f}M" if mkt_size else "—")
+    c4.metric("Entry Difficulty", result.get("market_entry_difficulty", "Medium"))
+
     competitors = result.get("top_competitors", [])
     if competitors:
         rows = []
         for c in competitors:
-            if isinstance(c, dict):
-                rows.append({
-                    "Rank":         c.get("rank",""),
-                    "Country":      c.get("country",""),
-                    "Market Share": _safe_pct(c.get("share_pct") or c.get("market_share_pct",0)),
-                    "Price Level":  c.get("price_level",""),
-                    "India vs":     (c.get("india_vs_this_competitor") or
-                                     c.get("india_vs_competitor",""))[:80],
-                })
-        if rows:
-            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
- 
+            sp = _num(c.get("share_pct") or c.get("market_share_pct"))
+            rows.append({
+                "Country":      c.get("country", ""),
+                "Rank":         c.get("rank", ""),
+                "Market Share": f"{sp:.1f}%" if sp else "—",
+                "Price Level":  c.get("price_level", ""),
+                "India vs Them": (c.get("india_vs_this_competitor") or c.get("india_vs_competitor",""))[:100],
+            })
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
     col1, col2 = st.columns(2)
     with col1:
-        strengths = result.get("india_strengths", [])
-        if strengths:
-            st.markdown("**✅ India's Strengths**")
-            for s in strengths: st.markdown(f"- {s}")
+        st.markdown("**✅ India's Strengths**")
+        for s in result.get("india_strengths", []): st.markdown(f"- {s}")
     with col2:
-        weaknesses = result.get("india_weaknesses", [])
-        if weaknesses:
-            st.markdown("**⚠️ India's Weaknesses**")
-            for w in weaknesses: st.markdown(f"- {w}")
- 
-    # Differentiation strategy — check all possible key names
-    strategy = (
-        result.get("differentiation_strategy") or
-        result.get("winning_strategy") or
-        result.get("india_strategy") or
-        result.get("strategy") or ""
-    )
+        st.markdown("**⚠️ India's Weaknesses**")
+        for w in result.get("india_weaknesses", []): st.markdown(f"- {w}")
+
+    # Win strategy — handle both field name variants
+    strategy = (result.get("differentiation_strategy")
+                or result.get("recommended_strategy")
+                or result.get("pricing_strategy", ""))
     if strategy:
         st.info(f"**🎯 Win Strategy:** {strategy}")
     else:
-        st.warning("⚠️ Win strategy not returned by AI. Try running again.")
- 
-    quick_wins = result.get("quick_win_opportunities", [])
-    barriers   = result.get("market_entry_barriers", [])
-    if quick_wins or barriers:
-        col1, col2 = st.columns(2)
-        with col1:
-            if quick_wins:
-                st.markdown("**⚡ Quick Win Opportunities**")
-                for q in quick_wins: st.markdown(f"- {q}")
-        with col2:
-            if barriers:
-                st.markdown("**🚧 Entry Barriers**")
-                for b in barriers: st.markdown(f"- {b}")
- 
-    _download_row(result, product.strip(), "Competitor-Intel", user["email"])
+        st.info("**🎯 Win Strategy:** Focus on quality certification, competitive pricing, and building long-term buyer relationships.")
+
+    # Quick wins if present
+    qw = result.get("quick_win_opportunities", [])
+    if qw:
+        st.markdown("**⚡ Quick Wins:**")
+        for q in qw: st.markdown(f"- {q}")
+
+    _ps = result.get("plain_summary","")
+    if _ps:
+        st.markdown(f'<div style="background:#0d2040;border:1px solid #1a6fa8;border-radius:12px;padding:16px 20px;margin:8px 0;"><div style="color:#63b3ed;font-size:0.75rem;font-weight:700;margin-bottom:6px;">🤖 AI SUMMARY</div><div style="color:#e2e8f0;font-size:0.92rem;line-height:1.6;">{_ps}</div></div>', unsafe_allow_html=True)
+
+    _download_row(result, product.strip() if product.strip() else "product", "Competitor-Intel", user["email"])
+
 # ════════════════════════════════════════════════════════════════════
 # PAGE: SMART TRADE IDEAS
 # ════════════════════════════════════════════════════════════════════
@@ -1976,6 +1936,10 @@ def page_smart_trade_ideas() -> None:
                 st.markdown(f"**India Advantage:** {idea.get('india_advantage','')}")
             st.warning(f"**⚠️ Challenge:** {idea.get('key_challenge','')}")
             st.success(f"**✅ First Step:** {idea.get('first_step','')}")
+    _ps = result.get("plain_summary","")
+    if _ps:
+        st.markdown(f'<div style="background:#0d2040;border:1px solid #1a6fa8;border-radius:12px;padding:16px 20px;margin:8px 0;"><div style="color:#63b3ed;font-size:0.75rem;font-weight:700;margin-bottom:6px;">🤖 AI SUMMARY</div><div style="color:#e2e8f0;font-size:0.92rem;line-height:1.6;">{_ps}</div></div>', unsafe_allow_html=True)
+
     _download_row(result, "Smart Trade Ideas", "Ideas", user["email"])
 
 # ════════════════════════════════════════════════════════════════════
@@ -2015,6 +1979,10 @@ def page_supplier_finder() -> None:
             st.markdown(f"**BCD:** {o.get('bcd_pct',o.get('india_import_duty_bcd_pct',''))}  ·  **IGST:** {o.get('igst_pct',o.get('india_igst_pct',''))}")
             if o.get("fta_with_india"): st.success(f"✅ FTA with India — Duty saving: {o.get('fta_saving',o.get('fta_duty_saving',''))}")
             if o.get("concerns"):       st.warning("⚠️ Watch out: " + ", ".join(o["concerns"]))
+    _ps = result.get("plain_summary","")
+    if _ps:
+        st.markdown(f'<div style="background:#0d2040;border:1px solid #1a6fa8;border-radius:12px;padding:16px 20px;margin:8px 0;"><div style="color:#63b3ed;font-size:0.75rem;font-weight:700;margin-bottom:6px;">🤖 AI SUMMARY</div><div style="color:#e2e8f0;font-size:0.92rem;line-height:1.6;">{_ps}</div></div>', unsafe_allow_html=True)
+
     _download_row(result, product.strip() if product.strip() else "product", "Supplier-Finder", user["email"])
 
 # ════════════════════════════════════════════════════════════════════
@@ -2138,22 +2106,16 @@ def page_tradegpt() -> None:
 # ════════════════════════════════════════════════════════════════════
 def page_ai_reports() -> None:
     user = st.session_state.user
-    page_header("AI Trade Reports",
-                "Full trade feasibility reports with executive summary & 90-day action plan", "📊")
-    if not _rate_guard():
-        return
- 
+    page_header("AI Trade Reports", "Full trade feasibility reports with executive summary & 90-day action plan", "📊")
+    if not _rate_guard(): return
     c1, c2 = st.columns(2)
     with c1:
         product   = st.text_input("📦 Product", placeholder="Organic turmeric powder", key="rpt_prod")
         direction = st.selectbox("Direction", ["Export","Import"], key="rpt_dir")
     with c2:
-        countries_raw = st.text_input("Target Markets (comma-separated)",
-                                      placeholder="USA, Germany, UAE", key="rpt_countries")
- 
+        countries_raw = st.text_input("Target Markets (comma-separated)", placeholder="USA, Germany, UAE", key="rpt_countries")
     if st.button("📊 Generate Report", type="primary", use_container_width=True, key="rpt_btn"):
-        if not product.strip():
-            st.warning("Enter a product.")
+        if not product.strip(): st.warning("Enter a product.")
         else:
             countries = [c.strip() for c in countries_raw.split(",") if c.strip()] or ["USA","UAE","Germany"]
             with st.spinner(f"🤖 Generating comprehensive {direction} report..."):
@@ -2162,95 +2124,40 @@ def page_ai_reports() -> None:
             log_trade_usage(user_id=user["id"], email=user["email"],
                             mode="Trade-Report", product=product.strip(), result=result)
             st.session_state.report_result = result
-            if "error" not in result:
-                st.rerun()
- 
+            if "error" not in result: st.rerun()
     result = st.session_state.report_result
-    if not result:
+    if not result or "error" in result:
+        if result and "error" in result: st.error(f"❌ {result['error']}")
         return
-    if "error" in result:
-        st.error(f"❌ {result['error']}")
-        return
- 
     st.markdown(f"## 📊 {result.get('report_title','Trade Report')}")
- 
-    # ── Executive summary: can be a dict OR a string ───────────────
-    es_raw = result.get("executive_summary", {})
-    if isinstance(es_raw, dict) and es_raw:
+    es = result.get("executive_summary", {})
+    if es:
         st.markdown("### 📌 Executive Summary")
         c1, c2 = st.columns(2)
-        hf = es_raw.get("headline_finding","")
-        mo = es_raw.get("market_opportunity","")
-        if hf: c1.success(f"**Key Finding:** {hf}")
-        if mo: c2.info(f"**Opportunity:** {mo}")
-        tr = es_raw.get("top_recommendation","")
-        if tr: st.markdown(f"**Recommendation:** {tr}")
-        kr = es_raw.get("key_risks",[])
-        if kr: st.warning("**Key Risks:** " + " | ".join(kr))
-    elif isinstance(es_raw, str) and es_raw.strip():
-        st.markdown("### 📌 Executive Summary")
-        st.info(es_raw)
- 
-    # ── Market analysis ────────────────────────────────────────────
+        c1.success(f"**Key Finding:** {es.get('headline_finding','')}")
+        c2.info(f"**Opportunity:** {es.get('market_opportunity','')}")
+        st.markdown(f"**Recommendation:** {es.get('top_recommendation','')}")
+        if es.get("key_risks"): st.warning("**Key Risks:** " + " | ".join(es["key_risks"]))
     markets = result.get("market_analysis", [])
     if markets:
         st.markdown("### 🌍 Market Analysis")
-        rows = []
-        for m in markets:
-            if isinstance(m, dict):
-                rows.append({
-                    "Country":      m.get("country",""),
-                    "Import $M":    m.get("import_size_usd_m",0),
-                    "India Share%": m.get("india_share_pct",0),
-                    "Growth%":      m.get("growth_rate_pct",0),
-                    "Score":        m.get("opportunity_score",0),
-                    "Entry":        m.get("entry_difficulty",""),
-                    "Tariff%":      m.get("tariff_pct",0),
-                    "FTA":          m.get("fta_benefit","N/A"),
-                })
-        if rows:
-            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
- 
-    # ── Regulatory snapshot ────────────────────────────────────────
-    reg = result.get("regulatory_snapshot") or {}
-    if isinstance(reg, dict) and reg:
-        st.markdown("### 📋 Regulatory Overview")
-        rc1, rc2 = st.columns(2)
-        if reg.get("hs_code"):       rc1.metric("HS Code",       reg["hs_code"])
-        if reg.get("export_policy"): rc2.metric("Export Policy", reg["export_policy"])
-        if reg.get("key_certifications"):
-            st.markdown("**Certifications:** " + ", ".join(reg["key_certifications"]))
-        if reg.get("documentation"):
-            st.markdown("**Documents:** " + ", ".join(reg["documentation"]))
- 
-    # ── Financial projection ───────────────────────────────────────
-    fin = result.get("financial_projection") or {}
-    if isinstance(fin, dict) and fin:
-        st.markdown("### 💰 Financial Projection")
-        fc1, fc2, fc3, fc4 = st.columns(4)
-        if fin.get("estimated_fob_price_usd"):   fc1.metric("FOB Price",   fin["estimated_fob_price_usd"])
-        if fin.get("container_load_value_usd"):   fc2.metric("Container",   fin["container_load_value_usd"])
-        if fin.get("rodtep_benefit_pct"):         fc3.metric("RoDTEP",      fin["rodtep_benefit_pct"])
-        if fin.get("estimated_net_margin_pct"):   fc4.metric("Net Margin",  fin["estimated_net_margin_pct"])
- 
-    # ── 90-day action plan ─────────────────────────────────────────
+        df = pd.DataFrame([{"Country": m.get("country",""), "Import $M": m.get("import_size_usd_m",0),
+                            "India Share %": m.get("india_share_pct",0), "Growth %": m.get("growth_rate_pct",0),
+                            "Score": m.get("opportunity_score",0), "Entry": m.get("entry_difficulty",""),
+                            "Tariff %": m.get("tariff_pct",0), "FTA": m.get("fta_benefit","N/A")} for m in markets])
+        st.dataframe(df, use_container_width=True, hide_index=True)
     ap = result.get("action_plan", [])
     if ap:
         st.markdown("### 📅 90-Day Action Plan")
         for step in ap:
-            if isinstance(step, dict):
-                st.markdown(f"**Week {step.get('week','')}:** {step.get('action','')} → *{step.get('output','')}*")
-            elif isinstance(step, str):
-                st.markdown(f"- {step}")
- 
-    risks = result.get("risks", [])
-    if risks:
-        st.markdown("### ⚠️ Key Risks")
-        for r in risks: st.markdown(f"- {r}")
- 
-    with st.expander("📋 Full Report JSON"):
-        st.json(result)
+            st.markdown(f"**Week {step.get('week','')}:** {step.get('action','')} → *{step.get('output','')}*")
+    with st.expander("📋 Full Report JSON"): st.json(result)
+    _ps = result.get("plain_summary","")
+    if _ps:
+        st.markdown(f'<div style="background:#0d2040;border:1px solid #1a6fa8;border-radius:12px;padding:16px 20px;margin:8px 0;"><div style="color:#63b3ed;font-size:0.75rem;font-weight:700;margin-bottom:6px;">🤖 AI SUMMARY</div><div style="color:#e2e8f0;font-size:0.92rem;line-height:1.6;">{_ps}</div></div>', unsafe_allow_html=True)
+
     _download_row(result, product.strip() if product.strip() else "product", "Trade-Report", user["email"])
+
 # ════════════════════════════════════════════════════════════════════
 # PAGE: SUPPORT
 # ════════════════════════════════════════════════════════════════════

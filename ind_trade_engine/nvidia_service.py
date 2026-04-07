@@ -2,101 +2,103 @@
 nvidia_service.py
 Indian Trade Intelligence Engine — Llama 3.3 70B via NVIDIA API
 ────────────────────────────────────────────────────────────────
-Security: API key from env only, never hardcoded
-Performance: in-memory response cache for identical prompts
-Reliability: retry with exponential backoff, 120s timeout
-Logging: structured, no secrets in logs
+v3.3 changes:
+  - All prompts now extract Indian STATE from product description
+    and give state-specific duty rates, clusters, schemes, ports
+  - Results include plain English summaries (not just JSON fields)
+  - Document analyzer: improved field extraction from any document
+  - Price intelligence: returns both numeric fields AND English summary
+  - World context: competitor analysis covers global landscape
 ────────────────────────────────────────────────────────────────
 """
 
-import os
-import re
-import json
-import time
-import hashlib
-import logging
-import requests
-from dotenv import load_dotenv
-import streamlit as st
-
-load_dotenv()
+import os, re, json, time, hashlib, logging, requests
 
 logger = logging.getLogger("nvidia_service")
 
-# ── Secure config — env or secrets ─────────────────────────────────────
 try:
-    API_KEY = st.secrets["NVIDIA_API_KEY"]
-except (KeyError, Exception):
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
+try:
+    import streamlit as st
+    API_KEY = st.secrets.get("NVIDIA_API_KEY", "") or os.getenv("NVIDIA_API_KEY", "").strip()
+except Exception:
     API_KEY = os.getenv("NVIDIA_API_KEY", "").strip()
+
 if not API_KEY:
-    raise ValueError("❌ NVIDIA_API_KEY not found in Streamlit secrets or .env — add it to your environment")
+    raise ValueError("NVIDIA_API_KEY not found in Streamlit secrets or .env")
 
 API_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
 MODEL   = "meta/llama-3.3-70b-instruct"
 
-# ── Response cache (in-memory, keyed by prompt hash) ─────────────
-_RESPONSE_CACHE: dict[str, dict] = {}
+_RESPONSE_CACHE: dict = {}
 _CACHE_MAX_SIZE = 200
 
-def _cache_key(prompt: str) -> str:
-    return hashlib.sha256(prompt.encode("utf-8")).hexdigest()[:16]
-
-def _cache_get(prompt: str) -> dict | None:
-    return _RESPONSE_CACHE.get(_cache_key(prompt))
-
-def _cache_set(prompt: str, result: dict) -> None:
+def _cache_key(p): return hashlib.sha256(p.encode()).hexdigest()[:16]
+def _cache_get(p): return _RESPONSE_CACHE.get(_cache_key(p))
+def _cache_set(p, r):
     if len(_RESPONSE_CACHE) >= _CACHE_MAX_SIZE:
-        oldest_key = next(iter(_RESPONSE_CACHE))
-        del _RESPONSE_CACHE[oldest_key]
-    _RESPONSE_CACHE[_cache_key(prompt)] = result
+        del _RESPONSE_CACHE[next(iter(_RESPONSE_CACHE))]
+    _RESPONSE_CACHE[_cache_key(p)] = r
+def clear_response_cache(): _RESPONSE_CACHE.clear()
 
-def clear_response_cache() -> None:
-    _RESPONSE_CACHE.clear()
-    logger.info("Response cache cleared")
 
-# ── Ground-truth context injected into prompts ───────────────────
-IMPORT_CONTEXT = """
-CONTEXT: You are analyzing imports INTO INDIA. All duties, taxes, and policies are INDIA's — NOT the USA, UK, EU, or any other country.
+# ── Indian state → trade details ─────────────────────────────────
+# Used to inject state-specific context into every prompt
+INDIA_STATES = {
+    "gujarat":      {"cluster":"Surat textiles, Ahmedabad pharma, Rajkot engineering, Morbi ceramics",  "main_port":"Mundra / Kandla", "key_schemes":"GIFT City, NSEZ Kandla, Surat Textile Park"},
+    "maharashtra":  {"cluster":"Mumbai finance, Pune auto, Nashik grapes/wine, Aurangabad manufacturing","main_port":"JNPT Mumbai",     "key_schemes":"SEEPZ Mumbai, Maharashtra Industrial Dev Corp"},
+    "tamil_nadu":   {"cluster":"Coimbatore textiles/pumps, Chennai auto, Tirupur garments",              "main_port":"Chennai / Ennore","key_schemes":"Madras Export Processing Zone, Tirupur cluster"},
+    "karnataka":    {"cluster":"Bengaluru IT/electronics, Hubli agri, Mysuru silk",                      "main_port":"New Mangalore",   "key_schemes":"KIADB, Bengaluru Tech exports"},
+    "andhra_pradesh":{"cluster":"Visakhapatnam pharma, Krishna spices, East Godavari aquaculture",       "main_port":"Visakhapatnam",   "key_schemes":"APIIC SEZ, Kakinada Port SEZ"},
+    "telangana":    {"cluster":"Hyderabad pharma/biotech, IT exports, Nizamabad turmeric",               "main_port":"Hyderabad ICD",   "key_schemes":"Hyderabad Pharma City, TSIIC"},
+    "west_bengal":  {"cluster":"Kolkata jute/leather, Darjeeling tea, Siliguri border trade",            "main_port":"Kolkata / Haldia","key_schemes":"Falta SEZ, Kolkata ICD"},
+    "kerala":       {"cluster":"Kochi spices/seafood, Calicut timber, Thiruvananthapuram IT",            "main_port":"Cochin",          "key_schemes":"Cochin SEZ, KINFRA parks"},
+    "rajasthan":    {"cluster":"Jaipur gems/jewellery, Jodhpur handicrafts, Bhilwara textiles",          "main_port":"Delhi ICD / Mundra via rail","key_schemes":"Jaipur Gems Cluster, Bhilwara Textile Park"},
+    "uttar_pradesh":{"cluster":"Agra leather/footwear, Varanasi silk, Moradabad brassware, Noida electronics","main_port":"Delhi ICD / Kanpur ICD","key_schemes":"UP Exports Promotion, Noida SEZ"},
+    "punjab":       {"cluster":"Ludhiana hosiery/cycles, Jalandhar sports goods, Amritsar food processing","main_port":"Delhi ICD",    "key_schemes":"Punjab Industrial Policy, Apparel Park Ludhiana"},
+    "haryana":      {"cluster":"Gurugram auto parts, Panipat textiles, Faridabad engineering",           "main_port":"Delhi ICD",       "key_schemes":"IMT Manesar, Haryana Industrial Policy"},
+    "madhya_pradesh":{"cluster":"Bhopal pharma, Indore food processing, Sagar diamonds",                "main_port":"Mundra via rail / Delhi ICD","key_schemes":"MPIDC, Pithampur Industrial Area"},
+    "odisha":       {"cluster":"Bhubaneswar IT, Kalahandi tribal crafts, Berhampur silk",                "main_port":"Paradip / Visakhapatnam","key_schemes":"Paradeep SEZ, Odisha Industrial Policy"},
+    "assam":        {"cluster":"Assam/Dibrugarh tea, Guwahati silk/bamboo, NE border trade",             "main_port":"Kolkata / Guwahati ICD","key_schemes":"NE Industrial Policy, AEZ Guwahati"},
+}
 
-Indian Import Duty Facts (2024 — Indian Customs Tariff Act, effective April 2024):
-- BCD (Basic Customs Duty) is charged by INDIA on goods arriving INTO India
-- Turmeric/spices: BCD 30-100% (agricultural protection); Edible oils: 5-100%; Electronics: 10-20%
-- BCD ranges: 0% (pharma APIs, life-saving drugs), 5% (chemicals, capital goods not made in India),
-  10% (electronics, metals), 15-30% (agriculture, processed food), 40-100% (luxury, alcohol, tobacco)
-- Agriculture BCD examples: Rice 80%, Wheat 50%, Sugar 100%, Spices 30-150%, Turmeric 30%
-- IGST rates: ONLY 5%, 12%, 18%, or 28% (food/agriculture typically 0-5%, manufactured goods 12-18%)
-- Social Welfare Surcharge (SWS) = always 10% of BCD
-- Total effective duty = BCD + SWS(10% of BCD) + IGST on (CIF + BCD + SWS)
-- Import Policy categories: Free / Restricted / Prohibited (exact words only)
-- SCOMET applies to: dual-use items, defence, nuclear, chemicals (OPCW-listed)
-- Special: MEIS/incentive schemes are EXPORT schemes, not import
-"""
+def _detect_state(text: str) -> dict | None:
+    """Extract Indian state from product description or return None."""
+    text_lower = text.lower()
+    state_aliases = {
+        "gujarat": ["gujarat","surat","ahmedabad","rajkot","vadodara","morbi"],
+        "maharashtra": ["maharashtra","mumbai","pune","nashik","aurangabad","nagpur"],
+        "tamil_nadu": ["tamil","coimbatore","chennai","tirupur","madurai","salem"],
+        "karnataka": ["karnataka","bangalore","bengaluru","mysore","hubli"],
+        "andhra_pradesh": ["andhra","vizag","visakhapatnam","vijayawada","guntur","krishna","kakinada"],
+        "telangana": ["telangana","hyderabad","nizamabad","warangal"],
+        "west_bengal": ["bengal","kolkata","calcutta","darjeeling","siliguri"],
+        "kerala": ["kerala","kochi","calicut","kozhikode","trivandrum"],
+        "rajasthan": ["rajasthan","jaipur","jodhpur","udaipur","bhilwara"],
+        "uttar_pradesh": ["uttar pradesh","up","agra","varanasi","noida","lucknow","kanpur","moradabad"],
+        "punjab": ["punjab","ludhiana","amritsar","jalandhar"],
+        "haryana": ["haryana","gurugram","faridabad","panipat"],
+        "madhya_pradesh": ["madhya pradesh","mp","bhopal","indore","jabalpur"],
+        "odisha": ["odisha","bhubaneswar","cuttack","paradip"],
+        "assam": ["assam","guwahati","dibrugarh","jorhat"],
+    }
+    for state_key, aliases in state_aliases.items():
+        if any(alias in text_lower for alias in aliases):
+            return {"state": state_key, **INDIA_STATES.get(state_key, {})}
+    return None
 
-EXPORT_CONTEXT = """
-Indian Export Policy Facts (2024 — DGFT Foreign Trade Policy):
-- Default status for most goods: Free (no restriction)
-- RoDTEP: applies to most manufactured/processed goods; replaced MEIS in 2021
-- RoSCTL: ONLY for apparel and made-up textiles — NOT general textiles/yarn
-- Prohibited exports: beef, certain wildlife, antiquities, sand, some ozone substances
-- Restricted (needs licence): arms, certain chemicals, some varieties of rice/sugar/onion
-- Export Duty: most goods = 0%; exceptions: iron ore, some raw hides, rice
-"""
-
-KNOWLEDGE_CONTEXT = """
-Indian GST Facts (2024 — GST Council):
-- 0%: fresh unprocessed food, milk, eggs, books, newspapers, healthcare
-- 5%: packed/branded food, edible oils, coal, life-saving medicines, transport services
-- 12%: processed food, computers, business travel, medicines not in 5% list
-- 18%: most manufactured goods, electronics, most services, chemicals
-- 28%: luxury cars, motorcycles >350cc, tobacco, aerated drinks, cement, washing machines
-- ITC available: for business inputs used in taxable supplies
-- ITC NOT available: personal consumption, motor vehicles (personal), food/beverages, beauty services
-"""
 
 SYSTEM_PROMPT = (
-    "You are a precise Indian trade compliance expert. "
-    "Return ONLY valid JSON — no markdown, no explanation, no preamble. "
-    "Use real Indian trade policy data. Never hallucinate duty rates or HS codes."
+    "You are a precise Indian trade compliance expert with deep knowledge of "
+    "Indian state-wise industry clusters, ports, and schemes. "
+    "Return ONLY valid JSON — no markdown fences, no explanation, no preamble. "
+    "Start with '{' end with '}'. "
+    "Always include a 'plain_summary' field with 2-3 sentences in simple English "
+    "explaining the key takeaway for a non-expert trader."
 )
 
 
@@ -104,677 +106,528 @@ SYSTEM_PROMPT = (
 # CORE LLM CALL
 # ════════════════════════════════════════════════════════════════════
 
-def _try_recover_json(text: str):
-    """
-    Attempt to recover a valid JSON object from a truncated LLM response.
-    Strategy 1: find outermost { } pair.
-    Strategy 2: balance open brackets/braces and retry parse.
-    Returns parsed dict or None.
-    """
-    if not text:
-        return None
-    # Strip markdown fences
-    clean = re.sub(r"^```(?:json)?\s*", "", text, flags=re.MULTILINE)
-    clean = re.sub(r"\s*```$", "", clean, flags=re.MULTILINE).strip()
-    # Strategy 1: outermost JSON object
-    m = re.search(r"\{[\s\S]*\}", clean)
-    if m:
-        try:
-            return json.loads(m.group(0))
-        except json.JSONDecodeError:
-            pass
-    # Strategy 2: balance truncated JSON
-    start = clean.find("{")
-    if start < 0:
-        return None
-    candidate = clean[start:]
-    open_b = candidate.count("{") - candidate.count("}")
-    open_a = candidate.count("[") - candidate.count("]")
-    if open_b > 0 or open_a > 0:
-        # Strip trailing incomplete token
-        fixed = re.sub(r',\s*"[^"]*"\s*:\s*"[^"]*$', "", candidate.rstrip())
-        fixed = re.sub(r',\s*"[^"]*"\s*:\s*$', "", fixed)
-        fixed = re.sub(r',\s*$', "", fixed)
-        fixed = fixed + ("}" * open_b) + ("]" * open_a)
-        ob2 = fixed.count("{") - fixed.count("}")
-        oa2 = fixed.count("[") - fixed.count("]")
-        if ob2 > 0 or oa2 > 0:
-            fixed += ("}" * max(0, ob2)) + ("]" * max(0, oa2))
-        try:
-            result = json.loads(fixed)
-            if isinstance(result, dict) and result:
-                return result
-        except json.JSONDecodeError:
-            pass
-    return None
-
-
-def _call_llama(
-    prompt: str,
-    retries: int = 3,
-    use_cache: bool = True,
-    max_tokens: int = 1024,
-) -> dict:
-    """
-    Call NVIDIA Llama 3.3 70B and return parsed JSON.
-    - Retries up to `retries` times on JSON parse failure
-    - Exponential backoff on rate limit / server errors
-    - In-memory caching for identical prompts
-    - Never logs the API key or raw user data
-    """
+def _call_llama(prompt, max_tokens=2000, temperature=0.2, retries=3, use_cache=True):
     if use_cache:
         cached = _cache_get(prompt)
-        if cached:
-            logger.debug("Serving from response cache")
-            return cached
-
-    text = ""
-    for attempt in range(retries + 1):
+        if cached: return cached
+    headers = {"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"}
+    payload = {
+        "model": MODEL,
+        "messages": [
+            {"role":"system","content": SYSTEM_PROMPT},
+            {"role":"user",  "content": prompt},
+        ],
+        "max_tokens": max_tokens, "temperature": temperature, "top_p": 0.95, "stream": False,
+    }
+    raw = ""
+    for attempt in range(retries):
         try:
-            headers = {
-                "Authorization": f"Bearer {API_KEY}",
-                "Content-Type":  "application/json",
-            }
-            payload = {
-                "model":       MODEL,
-                "messages": [
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user",   "content": prompt},
-                ],
-                "temperature": 0.1,
-                "max_tokens":  max_tokens,
-                "top_p":       0.9,
-            }
-
-            response = requests.post(
-                API_URL, headers=headers, json=payload, timeout=120
-            )
-            response.raise_for_status()
-            text = response.json()["choices"][0]["message"]["content"].strip()
-            logger.debug(f"NVIDIA API call successful (attempt {attempt + 1})")
-
-            # Strip markdown fences
-            clean = re.sub(r"^```(?:json)?\s*", "", text, flags=re.MULTILINE)
-            clean = re.sub(r"\s*```$",           "", clean, flags=re.MULTILINE).strip()
-
-            # Extract JSON object even if model added surrounding text
-            match = re.search(r"\{[\s\S]*\}", clean)
-            if match:
-                clean = match.group(0)
-
+            r = requests.post(API_URL, headers=headers, json=payload, timeout=120)
+            r.raise_for_status()
+            raw = r.json()["choices"][0]["message"]["content"].strip()
+            clean = re.sub(r"^```(?:json)?\s*","",raw,flags=re.IGNORECASE)
+            clean = re.sub(r"\s*```$","",clean).strip()
+            s = clean.find("{"); e = clean.rfind("}")
+            if s != -1 and e != -1: clean = clean[s:e+1]
             result = json.loads(clean)
-
-            if use_cache:
-                _cache_set(prompt, result)
-
+            if use_cache: _cache_set(prompt, result)
             return result
-
         except json.JSONDecodeError:
-            logger.warning(f"JSON decode failed on attempt {attempt + 1}: {text[:200]}")
-            # Try to salvage truncated JSON by finding the largest valid object
-            recovered = _try_recover_json(text)
-            if recovered:
-                logger.info("JSON recovered from truncated response")
-                if use_cache:
-                    _cache_set(prompt, recovered)
-                return recovered
-            if attempt < retries:
-                time.sleep(1.5 * (attempt + 1))
-                continue
-            return {
-                "error":        "AI response was not valid JSON — please retry",
-                "raw_response": text[:300],
-            }
-
+            if attempt == retries-1:
+                return {"error":"AI returned invalid JSON — please retry","raw":raw[:300]}
         except requests.exceptions.Timeout:
-            logger.warning(f"NVIDIA API timeout on attempt {attempt + 1}")
-            if attempt < retries:
-                time.sleep(3)
-                continue
-            return {"error": "Request timed out — NVIDIA servers are busy. Please retry."}
-
-        except requests.exceptions.HTTPError as e:
-            status_code = e.response.status_code if e.response else 0
-            if status_code == 429:
-                wait = 5 * (attempt + 1)
-                logger.warning(f"Rate limited — waiting {wait}s")
-                if attempt < retries:
-                    time.sleep(wait)
-                    continue
-                return {"error": "Rate limit reached — please wait a moment and retry"}
-            if status_code >= 500:
-                logger.error(f"NVIDIA API server error {status_code} on attempt {attempt + 1}")
-                if attempt < retries:
-                    time.sleep(3)
-                    continue
-            logger.error(f"NVIDIA API HTTP error {status_code}")
-            return {"error": f"API error {status_code} — please retry"}
-
-        except requests.exceptions.ConnectionError:
-            logger.error("NVIDIA API connection error")
-            if attempt < retries:
-                time.sleep(2)
-                continue
-            return {"error": "Connection failed — check your internet connection"}
-
-        except Exception as e:
-            logger.error(f"Unexpected error calling NVIDIA API: {type(e).__name__}: {e}")
-            return {"error": f"Unexpected error: {type(e).__name__}"}
-
-    return {"error": "Failed after all retries — please try again"}
+            if attempt == retries-1: return {"error":"Request timed out (120s). Try again."}
+        except requests.exceptions.HTTPError as ex:
+            sc = getattr(ex.response,"status_code",0)
+            if sc == 429: time.sleep(2**(attempt+1))
+            elif sc == 401: return {"error":"Invalid NVIDIA_API_KEY"}
+            else:
+                if attempt == retries-1: return {"error":f"API HTTP {sc}"}
+        except Exception as ex:
+            if attempt == retries-1: return {"error":str(ex)}
+        time.sleep(1.5*(attempt+1))
+    return {"error":"All retries failed"}
 
 
 # ════════════════════════════════════════════════════════════════════
-# VALIDATION
+# IMPORT / EXPORT / KNOWLEDGE — state-aware prompts
 # ════════════════════════════════════════════════════════════════════
 
-def _validate_hs(result: dict) -> dict:
-    hs = str(result.get("hs_code", "")).strip()
-    if not hs.isdigit() or len(hs) not in (6, 8):
-        result["validation_warning"] = (
-            f"HS code '{hs}' may be incorrect — ITC-HS codes are 8 digits. "
-            "Verify at icegate.gov.in"
-        )
-    return result
+IMPORT_CONTEXT = """Indian Import Rules (2024):
+- BCD: 0% pharma/APIs, 5% chemicals/capital goods, 10% electronics, 15-30% agriculture, 30-150% spices
+- IGST: only 5%, 12%, 18%, or 28%
+- SWS = 10% of BCD always
+- Import Policy: Free / Restricted / Prohibited
+- SCOMET: dual-use, defence, nuclear, OPCW chemicals"""
+
+EXPORT_CONTEXT = """Indian Export Policy (2024 DGFT FTP):
+- Default: Free for most goods
+- RoDTEP: most manufactured goods (replaced MEIS 2021)
+- RoSCTL: ONLY apparel and made-up textiles
+- Export Duty: 0% most goods; exceptions: iron ore, rice, raw hides
+- Prohibited: beef, some wildlife, antiquities, sand"""
+
+KNOWLEDGE_CONTEXT = """Indian GST (2024):
+- 0%: fresh food, milk, books, healthcare
+- 5%: packed food, edible oils, coal, essential medicines
+- 12%: processed food, computers, business medicines
+- 18%: most manufactured goods, electronics, chemicals
+- 28%: luxury cars, tobacco, aerated drinks, cement"""
 
 
-# ════════════════════════════════════════════════════════════════════
-# HS CLASSIFICATION
-# ════════════════════════════════════════════════════════════════════
-
-def classify_product(product_description: str) -> dict:
-    prompt = f"""Classify this product under the Indian ITC-HS Schedule (8-digit).
-
-Product: {product_description}
-
-Rules:
-- hs_code MUST be exactly 8 numeric digits
-- Use the most specific ITC-HS subheading available
-- confidence: 0.0 to 1.0
-
-Return ONLY this JSON:
-{{
-  "hs_code": "XXXXXXXX",
-  "description": "official ITC-HS description",
-  "chapter": "Chapter XX - name",
-  "confidence": 0.92,
-  "note": "classification note or empty string"
-}}"""
-
-    result = _call_llama(prompt)
-    if "error" not in result:
-        result = _validate_hs(result)
-    return result
+def trade_intelligence_engine(product: str, mode: str) -> dict:
+    if not product.strip():
+        return {"error": "Product description cannot be empty"}
+    if mode == "Import":   return _import_analysis(product)
+    elif mode == "Export": return _export_analysis(product)
+    else:                  return _knowledge_analysis(product)
 
 
-# ════════════════════════════════════════════════════════════════════
-# IMPORT INTELLIGENCE
-# ════════════════════════════════════════════════════════════════════
-
-def get_import_details(product_description: str) -> dict:
-    prompt = (
-        "You are an Indian customs and tariff expert. "
-        "Analyse this product being IMPORTED INTO INDIA (not US, not EU — INDIA ONLY).\n\n"
-        f"{IMPORT_CONTEXT}\n\n"
-        f"Product being imported into India: {product_description}\n\n"
-        "CRITICAL RULES — failure to follow = wrong answer:\n"
-        "1. BCD = India's Basic Customs Duty rate as per Indian Customs Tariff Act 2024\n"
-        "2. India's agricultural BCD is HIGH (30-150%) — never give US/EU rates\n"
-        "3. IGST must be EXACTLY one of: 5, 12, 18, or 28 (no decimals, no other values)\n"
-        "4. SWS = always 10% of BCD (Social Welfare Surcharge)\n"
-        "5. import_policy_status: exactly one of: Free, Restricted, or Prohibited\n"
-        "6. hs_code: exactly 8 digits from ITC-HS 2022 Schedule\n\n"
-        "Return ONLY this JSON (no markdown, no preamble):\n"
-        "{\n"
-        '  "hs_code": "8 digit ITC-HS 2022",\n'
-        '  "product_description": "brief product description",\n'
-        '  "basic_customs_duty_percent": "X% (India BCD)",\n'
-        '  "social_welfare_surcharge_percent": "Y% (10% of BCD)",\n'
-        '  "igst_percent": "Z% (5/12/18/28 only)",\n'
-        '  "total_landed_cost_percent": "approx total effective import duty %",\n'
-        '  "import_policy_status": "Free",\n'
-        '  "license_required": false,\n'
-        '  "scomet_applicable": false,\n'
-        '  "special_conditions": "conditions or empty string",\n'
-        '  "data_confidence": "high"\n'
-        "}"
+def _state_context_block(product: str) -> str:
+    state = _detect_state(product)
+    if not state:
+        return "No specific Indian state detected — provide general India-wide analysis."
+    return (
+        f"STATE DETECTED: {state['state'].replace('_',' ').title()}\n"
+        f"Key industry clusters: {state.get('cluster','')}\n"
+        f"Primary export port: {state.get('main_port','')}\n"
+        f"Relevant schemes: {state.get('key_schemes','')}\n"
+        f"Use this state context to give state-specific duty rates, port charges, and scheme benefits."
     )
 
-    result = _call_llama(prompt)
-    if "error" not in result:
-        result = _validate_hs(result)
-        igst = str(result.get("igst_percent", "")).replace("%", "").strip()
-        if igst and igst not in ["5", "12", "18", "28"]:
-            result["validation_warning"] = (
-                f"IGST '{igst}%' is non-standard — Indian GST rates are 5/12/18/28%. Verify manually."
-            )
-    return result
+
+def _import_analysis(product: str) -> dict:
+    state_ctx = _state_context_block(product)
+    prompt = f"""{IMPORT_CONTEXT}
+
+{state_ctx}
+
+Product being imported INTO INDIA: {product}
+
+Return ONLY this JSON with real values specific to this product and state:
+{{
+  "hs_code": "8-digit ITC-HS",
+  "product_description": "brief description",
+  "basic_customs_duty_percent": "X%",
+  "social_welfare_surcharge_percent": "X% (10% of BCD)",
+  "igst_percent": "X% (5/12/18/28 only)",
+  "total_landed_cost_percent": "approx % above CIF",
+  "import_policy_status": "Free",
+  "license_required": false,
+  "scomet_applicable": false,
+  "special_conditions": "any conditions or empty string",
+  "state_specific_note": "state-specific port/scheme/cluster info if state detected, else India-general",
+  "data_confidence": "high",
+  "validation_warning": null,
+  "plain_summary": "2-3 sentence plain English explanation of the key import duties and restrictions for this product, mentioning total cost burden and any licence/restriction flags"
+}}"""
+    r = _call_llama(prompt, max_tokens=1400)
+    if "error" not in r: r = _validate_hs(r)
+    return r
 
 
-# ════════════════════════════════════════════════════════════════════
-# EXPORT INTELLIGENCE
-# ════════════════════════════════════════════════════════════════════
+def _export_analysis(product: str) -> dict:
+    state_ctx = _state_context_block(product)
+    prompt = f"""{EXPORT_CONTEXT}
 
-def get_export_details(product_description: str) -> dict:
-    prompt = f"""You are an Indian export policy expert. Analyse this product's export requirements.
+{state_ctx}
 
-{EXPORT_CONTEXT}
-
-Product: {product_description}
-
-IMPORTANT:
-- RoSCTL applies ONLY to apparel/made-up textiles, NOT other goods
-- RoDTEP applies to most manufactured goods
-- export_policy_status must be exactly: Free, Restricted, or Prohibited
+Product being EXPORTED FROM INDIA: {product}
 
 Return ONLY this JSON:
 {{
-  "hs_code": "8 digit ITC-HS code",
+  "hs_code": "8-digit ITC-HS",
   "product_description": "brief description",
   "export_policy_status": "Free",
+  "export_duty_percent": "0%",
   "rodtep_applicable": true,
   "rodtep_rate_percent": "X%",
   "rosctl_applicable": false,
-  "export_duty_percent": "0%",
-  "export_incentive_notes": "specific schemes available",
-  "restricted_countries": "country restrictions or none",
+  "export_incentive_notes": "applicable incentives including state schemes",
   "documentation_required": "key documents",
-  "data_confidence": "high"
+  "restricted_countries": "none or list",
+  "state_specific_note": "which port to use, state cluster benefits, APEDA/EPC relevant to this state",
+  "data_confidence": "high",
+  "validation_warning": null,
+  "plain_summary": "2-3 sentence plain English summary of export opportunity: incentives available, policy status, and state-specific advantages like port or cluster"
 }}"""
-
-    result = _call_llama(prompt)
-    if "error" not in result:
-        result = _validate_hs(result)
-    return result
+    r = _call_llama(prompt, max_tokens=1400)
+    if "error" not in r: r = _validate_hs(r)
+    return r
 
 
-# ════════════════════════════════════════════════════════════════════
-# KNOWLEDGE MODE
-# ════════════════════════════════════════════════════════════════════
+def _knowledge_analysis(product: str) -> dict:
+    state_ctx = _state_context_block(product)
+    prompt = f"""{KNOWLEDGE_CONTEXT}
 
-def get_knowledge_details(product_description: str) -> dict:
-    prompt = f"""You are an Indian GST and trade compliance advisor. Analyse this product.
+{state_ctx}
 
-{KNOWLEDGE_CONTEXT}
-
-Product: {product_description}
-
-IMPORTANT:
-- gst_percent must be exactly 0, 5, 12, 18, or 28
-- ITC is available for business use, not personal use
+Product: {product}
 
 Return ONLY this JSON:
 {{
-  "hs_code": "8 digit ITC-HS code",
+  "hs_code": "8-digit ITC-HS",
   "product_description": "brief description",
   "gst_percent": "X%",
-  "gst_category": "Exempt / Zero-rated / Standard",
+  "gst_category": "Exempt / Zero-rated / Reduced / Standard",
   "itc_available": true,
-  "itc_conditions": "eligibility conditions",
-  "compliance_requirements": "key compliance notes",
+  "itc_conditions": "eligibility details",
+  "compliance_requirements": "FSSAI/BIS/other requirements",
   "fssai_required": false,
   "bis_required": false,
   "other_regulatory": "other requirements or none",
-  "risk_flags": "risk flags or null",
-  "data_confidence": "high"
+  "risk_flags": null,
+  "state_specific_note": "any state-specific GST or compliance note",
+  "data_confidence": "high",
+  "validation_warning": null,
+  "plain_summary": "2-3 sentence plain English summary of GST rate, ITC eligibility, and key compliance requirements for this product"
 }}"""
+    r = _call_llama(prompt, max_tokens=1400)
+    if "error" not in r: r = _validate_hs(r)
+    return r
 
-    result = _call_llama(prompt)
-    if "error" not in result:
-        result = _validate_hs(result)
-        gst = str(result.get("gst_percent", "")).replace("%", "").strip()
-        if gst and gst not in ["0", "5", "12", "18", "28"]:
-            result["validation_warning"] = (
-                f"GST '{gst}%' is non-standard — Indian GST rates are 0/5/12/18/28%. Verify manually."
-            )
+
+def _validate_hs(result: dict) -> dict:
+    hs = str(result.get("hs_code","")).strip()
+    if not hs.isdigit() or len(hs) not in (6,8):
+        result["validation_warning"] = (
+            f"HS code '{hs}' may be incorrect — ITC-HS codes are 8 digits. Verify at icegate.gov.in")
     return result
-
-
-# ════════════════════════════════════════════════════════════════════
-# MASTER ENGINE
-# ════════════════════════════════════════════════════════════════════
-
-def trade_intelligence_engine(product_description: str, mode: str) -> dict:
-    """Main entry point: route to appropriate analysis function."""
-    if not product_description.strip():
-        return {"error": "Product description cannot be empty"}
-
-    # Input length guard
-    if len(product_description) > 2000:
-        product_description = product_description[:2000]
-        logger.warning("Product description truncated to 2000 characters")
-
-    dispatch = {
-        "Import":    get_import_details,
-        "Export":    get_export_details,
-        "Knowledge": get_knowledge_details,
-    }
-
-    fn = dispatch.get(mode)
-    if fn is None:
-        return {"error": f"Invalid mode '{mode}'. Choose Import, Export, or Knowledge."}
-
-    logger.info(f"Trade analysis requested: mode={mode}, product_length={len(product_description)}")
-    return fn(product_description)
 
 
 # ════════════════════════════════════════════════════════════════════
 # TRADEGPT CHAT
 # ════════════════════════════════════════════════════════════════════
 
-def chat_with_tradegpt(messages: list, user_message: str) -> dict:
-    """Multi-turn trade Q&A chat."""
-    history = ""
-    for m in messages[-6:]:  # last 3 exchanges
-        role = "User" if m["role"] == "user" else "Assistant"
-        history += f"{role}: {m['content']}\n"
+def chat_with_tradegpt(history: list, user_message: str) -> dict:
+    state = _detect_state(user_message)
+    state_note = (
+        f"\nUser appears to be from {state['state'].replace('_',' ').title()} "
+        f"— mention relevant ports ({state.get('main_port','')}), "
+        f"clusters ({state.get('cluster','')[:60]}), and schemes ({state.get('key_schemes','')[:60]}) "
+        f"where applicable."
+    ) if state else ""
 
-    prompt = f"""You are TradeGPT, an expert on Indian import/export regulations, customs, GST, DGFT policy, and trade finance.
+    messages = [{"role":"system","content":(
+        "You are TradeGPT, an expert Indian trade advisor covering imports, exports, customs, "
+        "GST, DGFT policy, state-wise industry clusters, FTAs, Incoterms, trade finance, and global trade. "
+        "Give practical, actionable answers in plain English. "
+        "Include state-specific port, cluster, and scheme information when the state is mentioned. "
+        "Also cover global trade context — not just India."
+        + state_note +
+        "\nReturn JSON: {\"reply\": \"answer in plain English\", \"follow_up_questions\": [\"q1\",\"q2\"], \"relevant_links\": []}"
+    )}]
+    for m in (history or [])[-6:]:
+        if isinstance(m,dict) and m.get("role") in ("user","assistant"):
+            messages.append({"role":m["role"],"content":m["content"]})
+    messages.append({"role":"user","content":user_message})
 
-Conversation so far:
-{history}
-User: {user_message}
-
-Answer helpfully and accurately. If you mention HS codes, duties, or regulations, be precise.
-Return ONLY this JSON:
-{{
-  "reply": "your detailed answer here",
-  "follow_up_questions": ["question 1?", "question 2?", "question 3?"],
-  "relevant_links": ["https://icegate.gov.in", "https://dgft.gov.in"]
-}}"""
-    return _call_llama(prompt, max_tokens=1200)
+    headers = {"Authorization":f"Bearer {API_KEY}","Content-Type":"application/json"}
+    payload = {"model":MODEL,"messages":messages,"max_tokens":1500,"temperature":0.3,"stream":False}
+    for attempt in range(3):
+        try:
+            r = requests.post(API_URL, headers=headers, json=payload, timeout=120)
+            r.raise_for_status()
+            raw = r.json()["choices"][0]["message"]["content"].strip()
+            clean = re.sub(r"^```(?:json)?\s*","",raw,flags=re.IGNORECASE)
+            clean = re.sub(r"\s*```$","",clean).strip()
+            s = clean.find("{"); e = clean.rfind("}")
+            if s != -1 and e != -1: clean = clean[s:e+1]
+            try:   return json.loads(clean)
+            except: return {"reply":raw,"follow_up_questions":[],"relevant_links":[]}
+        except Exception as ex:
+            if attempt == 2: return {"error":str(ex),"reply":f"Error: {ex}","follow_up_questions":[]}
+            time.sleep(1.5*(attempt+1))
+    return {"reply":"Request failed. Please try again.","follow_up_questions":[]}
 
 
 # ════════════════════════════════════════════════════════════════════
-# RISK ANALYZER
+# RISK ANALYZER — state-aware, geopolitical
 # ════════════════════════════════════════════════════════════════════
 
-def analyze_trade_risk(
-    product: str,
-    origin_country: str,
-    supplying_country: str,
-    buyer_countries: str,
-    direction: str = "Export",
-    value_usd: str = "50,000",
-) -> dict:
-    """
-    Comprehensive trade risk assessment with geopolitical context.
-    origin_country  — where the product originates / is produced
-    supplying_country — who is supplying (often same as origin, can differ)
-    buyer_countries — destination / importing countries
-    """
+def analyze_trade_risk(product, origin_country, supplying_country, buyer_countries,
+                       direction="Export", value_usd="50,000"):
+    state = _detect_state(product + " " + origin_country)
+    state_note = (
+        f"Origin state detected: {state['state'].replace('_',' ').title()}. "
+        f"Primary port: {state.get('main_port','')}. "
+        f"Key schemes: {state.get('key_schemes','')}."
+    ) if state else "No specific Indian state detected."
+
     prompt = (
-        "You are a senior Indian trade risk analyst. "
-        "Assess ALL risks for this trade deal using current 2024-2025 geopolitical knowledge.\n\n"
+        "You are a senior Indian trade risk analyst with global expertise.\n\n"
         f"Product: {product}\n"
-        f"Origin Country (production): {origin_country}\n"
-        f"Supplying Country (exporter): {supplying_country}\n"
-        f"Buyer / Destination Countries: {buyer_countries}\n"
-        f"Trade Direction (India perspective): {direction}\n"
-        f"Deal Value: USD {value_usd}\n\n"
-        "IMPORTANT — Consider ALL of the following for each risk category:\n"
-        "- Current sanctions, trade embargoes, export controls (US/EU/UN)\n"
-        "- Active geopolitical tensions (Russia-Ukraine, Israel-Gaza, China-Taiwan, India-Pakistan, Red Sea)\n"
-        "- India FTA status with buyer/supplier countries\n"
-        "- Currency volatility (USD/INR, relevant cross-rates)\n"
-        "- Port/logistics disruptions (Suez Canal, Red Sea, specific ports)\n"
-        "- Origin mismatch risk (product origin ≠ supplying country → anti-dumping, mislabelling)\n"
-        "- Payment default risk (country credit rating, LC requirements)\n\n"
-        "Return ONLY this JSON (no markdown, no preamble):\n"
+        f"Origin: {origin_country} | Supplying: {supplying_country} | Buyers: {buyer_countries}\n"
+        f"Direction: {direction} | Value: USD {value_usd}\n"
+        f"{state_note}\n\n"
+        "Consider: UN/US/EU sanctions, current geopolitical tensions (Russia-Ukraine, Red Sea, "
+        "India-Pakistan, China-Taiwan), India FTAs, currency risk, port disruptions, "
+        "anti-dumping orders, payment risk. Also consider global trade routes and insurance.\n\n"
+        "Return ONLY this JSON:\n"
         "{\n"
         '  "overall_risk_score": 65,\n'
         '  "risk_level": "Medium",\n'
-        '  "executive_summary": "3 sentence summary covering key risks",\n'
-        '  "geopolitical_alert": "specific current geopolitical concern or null",\n'
-        '  "origin_supplying_mismatch_risk": "risk if origin≠supplier or null",\n'
+        '  "executive_summary": "3-sentence plain English risk summary",\n'
+        '  "geopolitical_alert": "current concern or null",\n'
+        '  "origin_supplying_mismatch_risk": "mismatch risk or null",\n'
         '  "risk_categories": [\n'
-        '    {"category":"Regulatory & Sanctions","score":70,"level":"High","details":"explanation","mitigation":"how to mitigate"},\n'
-        '    {"category":"Geopolitical Risk","score":65,"level":"Medium","details":"current events impact","mitigation":"steps"},\n'
-        '    {"category":"Currency & Payment","score":45,"level":"Medium","details":"forex and payment risk","mitigation":"LC/hedging"},\n'
-        '    {"category":"Logistics & Routing","score":55,"level":"Medium","details":"port/route risks","mitigation":"alternate routes"},\n'
-        '    {"category":"Market & Demand","score":40,"level":"Low","details":"demand/price risk","mitigation":"strategy"},\n'
-        '    {"category":"Compliance & Documentation","score":60,"level":"Medium","details":"certification/labelling risk","mitigation":"steps"}\n'
+        '    {"category":"Regulatory & Sanctions","score":45,"level":"Medium","details":"plain English details","mitigation":"plain English action"},\n'
+        '    {"category":"Geopolitical Risk","score":30,"level":"Low","details":"details","mitigation":"action"},\n'
+        '    {"category":"Currency & Payment","score":40,"level":"Medium","details":"details","mitigation":"action"},\n'
+        '    {"category":"Logistics & Routing","score":35,"level":"Low","details":"details","mitigation":"action"},\n'
+        '    {"category":"Market & Demand","score":50,"level":"Medium","details":"details","mitigation":"action"},\n'
+        '    {"category":"Compliance & Documentation","score":25,"level":"Low","details":"details","mitigation":"action"}\n'
         '  ],\n'
-        '  "key_recommendations": ["recommendation 1","recommendation 2","recommendation 3","recommendation 4"],\n'
-        '  "payment_terms_advice": "recommended payment method (LC/DP/DA/advance)",\n'
-        '  "insurance_suggestion": "insurance type and coverage advice",\n'
-        '  "data_confidence": "high"\n'
+        '  "key_recommendations": ["action 1 in plain English","action 2","action 3"],\n'
+        '  "payment_terms_advice": "recommended payment method and reason",\n'
+        '  "insurance_suggestion": "insurance type and why",\n'
+        '  "state_port_advice": "which Indian port and why, considering detected state",\n'
+        '  "fta_applicable": false,\n'
+        '  "fta_detail": null,\n'
+        '  "plain_summary": "2-3 sentence plain English bottom line for a trader",\n'
+        '  "data_confidence": "medium"\n'
         "}"
     )
-    return _call_llama(prompt, max_tokens=2200)
+    return _call_llama(prompt, max_tokens=2500, use_cache=False)
 
 
 # ════════════════════════════════════════════════════════════════════
-# PRICE INTELLIGENCE
+# PRICE INTELLIGENCE — flat numeric + English summary
 # ════════════════════════════════════════════════════════════════════
 
 def get_price_intelligence(product: str, quantity: str, market: str) -> dict:
-    """Global price benchmarking for a product."""
-    prompt = f"""You are a global commodity and trade price analyst with expertise in Indian exports.
+    state = _detect_state(product)
+    state_note = (
+        f"Seller/origin state: {state['state'].replace('_',' ').title()}. "
+        f"Export port: {state.get('main_port','')}. "
+        f"Note any state-specific price advantage or cluster."
+    ) if state else "No specific Indian state mentioned."
+
+    prompt = f"""You are a global commodity price analyst specializing in Indian exports.
 
 Product: {product}
 Quantity: {quantity}
 Target Market: {market}
+{state_note}
 
-Provide realistic price intelligence. Return ONLY this JSON:
+Provide REALISTIC 2024 price data. All numeric fields must be actual numbers (NOT strings or zero).
+
+Return ONLY this JSON:
 {{
   "product": "{product}",
-  "analysis_date": "2024",
-  "fob_india_price_usd": "price per unit/MT",
-  "cif_destination_usd": "estimated CIF price",
-  "global_price_range_usd": "low - high per unit/MT",
-  "india_competitiveness": "Strong / Moderate / Weak",
-  "price_trend_6m": "Rising / Stable / Falling",
-  "price_trend_details": "explanation of trend",
+  "fob_usd": 1100,
+  "dom_inr": 82000,
+  "landed_usd": 1500,
+  "margin_min_pct": 12,
+  "margin_max_pct": 22,
+  "price_unit": "per MT",
+  "india_fob_price_usd": {{"min": 900, "max": 1400, "typical": 1100, "unit": "per MT"}},
+  "india_domestic_price_inr": {{"min": 70000, "max": 100000, "typical": 82000, "unit": "per MT"}},
+  "target_market_landed_usd": {{"min": 1200, "max": 1800, "typical": 1500, "unit": "per MT"}},
+  "gross_margin_pct": {{"min": 12, "max": 22}},
+  "global_price_trend": "Rising",
+  "trend_reason": "specific reason for {product} price trend",
+  "india_price_advantage": "India's specific pricing advantage for {product}",
+  "state_advantage": "state-specific cluster or quality advantage if applicable",
   "competitor_prices": [
-    {{"country": "China", "price_usd": "X per MT", "quality_note": "note"}},
-    {{"country": "Vietnam", "price_usd": "X per MT", "quality_note": "note"}},
-    {{"country": "Thailand", "price_usd": "X per MT", "quality_note": "note"}}
+    {{"country": "top competitor country", "price_usd_per_unit": 950, "quality_note": "note"}},
+    {{"country": "second competitor", "price_usd_per_unit": 1050, "quality_note": "note"}}
   ],
-  "margin_estimate_pct": "estimated profit margin %",
-  "pricing_strategy": "recommended pricing approach",
-  "key_price_drivers": ["driver 1", "driver 2", "driver 3"],
+  "pricing_strategy": "recommended strategy for {market}",
+  "key_price_drivers": ["driver 1", "seasonal factor", "global demand factor"],
+  "data_note": "Indicative 2024 estimates. Verify with real quotes before trading.",
+  "plain_summary": "2-3 sentence plain English summary: what is the typical export price, margin potential, and India's competitive position in {market}",
   "data_confidence": "medium"
-}}"""
-    return _call_llama(prompt, max_tokens=1500)
+}}
+
+CRITICAL: fob_usd, dom_inr, landed_usd = actual NUMBERS for {product}. Never use 0."""
+    return _call_llama(prompt, max_tokens=2000, use_cache=False)
 
 
 # ════════════════════════════════════════════════════════════════════
-# COMPETITOR INTELLIGENCE
+# COMPETITOR INTELLIGENCE — global + state context
 # ════════════════════════════════════════════════════════════════════
 
 def get_competitor_intelligence(product: str, market: str) -> dict:
-    """Competitive landscape analysis for Indian exporters."""
-    prompt = f"""You are a trade intelligence analyst. Analyse the competitive landscape for Indian exporters.
+    state = _detect_state(product)
+    state_note = (
+        f"Indian origin cluster: {state['state'].replace('_',' ').title()} "
+        f"({state.get('cluster','')[:80]}). "
+        f"Mention this cluster's specific advantages vs global competitors."
+    ) if state else "Provide India-wide competitive analysis."
+
+    prompt = f"""You are a trade intelligence analyst with global market expertise.
 
 Product: {product}
 Target Market: {market}
+{state_note}
+
+Identify ACTUAL competing countries. Do NOT use generic placeholders.
 
 Return ONLY this JSON:
 {{
   "product": "{product}",
   "market": "{market}",
-  "india_market_share_pct": "X%",
-  "india_rank": "X of Y major exporters",
-  "india_strengths": ["strength 1", "strength 2", "strength 3"],
-  "india_weaknesses": ["weakness 1", "weakness 2"],
+  "india_market_share_pct": 15,
+  "india_rank": 3,
+  "market_total_imports_usd_m": 500,
+  "market_entry_difficulty": "Medium",
+  "india_strengths": ["specific strength 1","specific strength 2","specific strength 3"],
+  "india_weaknesses": ["specific weakness 1","specific weakness 2"],
   "top_competitors": [
-    {{
-      "country": "China",
-      "market_share_pct": "X%",
-      "price_advantage": "cheaper/pricier by X%",
-      "quality_position": "description",
-      "india_advantage_over": "how India can beat them"
-    }},
-    {{
-      "country": "Vietnam",
-      "market_share_pct": "X%",
-      "price_advantage": "cheaper/pricier by X%",
-      "quality_position": "description",
-      "india_advantage_over": "how India can beat them"
-    }},
-    {{
-      "country": "Thailand",
-      "market_share_pct": "X%",
-      "price_advantage": "cheaper/pricier by X%",
-      "quality_position": "description",
-      "india_advantage_over": "how India can beat them"
-    }}
+    {{"country":"ACTUAL #1 exporter","rank":1,"share_pct":32,"market_share_pct":32,
+      "price_level":"X% cheaper/pricier than India","quality_position":"description",
+      "india_vs_this_competitor":"how India can beat them specifically"}},
+    {{"country":"ACTUAL #2 exporter","rank":2,"share_pct":20,"market_share_pct":20,
+      "price_level":"comparison","quality_position":"description",
+      "india_vs_this_competitor":"India advantage"}},
+    {{"country":"ACTUAL #3 exporter","rank":4,"share_pct":10,"market_share_pct":10,
+      "price_level":"comparison","quality_position":"description",
+      "india_vs_this_competitor":"India advantage"}}
   ],
-  "market_entry_barriers": ["barrier 1", "barrier 2"],
-  "differentiators": ["differentiator 1", "differentiator 2", "differentiator 3"],
-  "recommended_strategy": "strategic recommendation",
+  "differentiation_strategy": "2-3 sentence specific strategy for India to gain share in {market} — pricing, certification, branding",
+  "market_entry_barriers": ["barrier 1","barrier 2"],
+  "quick_win_opportunities": ["opportunity 1","opportunity 2"],
+  "global_trade_context": "1-2 sentences on global supply chain trends affecting {product} in {market}",
+  "plain_summary": "2-3 sentence plain English summary of India's competitive position and recommended action",
   "data_confidence": "medium"
-}}"""
-    return _call_llama(prompt, max_tokens=2000)
+}}
+
+CRITICAL: india_market_share_pct and india_rank = NUMBERS not strings."""
+    return _call_llama(prompt, max_tokens=2400, use_cache=False)
 
 
 # ════════════════════════════════════════════════════════════════════
-# SMART TRADE IDEAS
+# SMART TRADE IDEAS — state-specific
 # ════════════════════════════════════════════════════════════════════
 
 def generate_smart_trade_ideas(profile: str, budget: str, direction: str, industry: str) -> dict:
-    """
-    Generate 5 tailored import/export business ideas.
-    2 calls to avoid JSON truncation: Call1 → ideas 1-3, Call2 → ideas 4-5.
-    """
-    ctx = (f"Trader profile: {profile}. Budget: {budget}. "
-           f"Trade direction: {direction}. Industry focus: {industry}.")
+    state = _detect_state(profile + " " + industry)
+    state_note = (
+        f"Trader's state: {state['state'].replace('_',' ').title()}. "
+        f"Local clusters: {state.get('cluster','')}. "
+        f"Port: {state.get('main_port','')}. "
+        f"Schemes: {state.get('key_schemes','')}. "
+        f"Prioritize products that leverage this state's existing industry clusters."
+    ) if state else "No specific state detected — provide India-wide ideas."
 
-    def _idea_schema(rank: int) -> str:
+    ctx = f"Profile: {profile}. Budget: {budget}. Direction: {direction}. Industry: {industry}. {state_note}"
+
+    def _schema(rank):
         return (
-            f'{{"rank":{rank},"title":"<name>","product":"<product>",'
-            f'"hs_code_range":"HS Chapter XX",'
-            f'"target_markets":["Country1","Country2"],'
-            f'"initial_investment_inr":"X lakhs",'
-            f'"monthly_revenue_potential_inr":"X lakhs",'
-            f'"typical_margin_pct":"X-Y%",'
-            f'"difficulty_level":"Easy",'
-            f'"why_now":"<1 sentence>",'
-            f'"india_advantage":"<1 sentence>",'
-            f'"relevant_schemes":["RODTEP"],'
-            f'"key_challenge":"<1 sentence>",'
-            f'"first_step":"<1 sentence>"}}'
+            f'{{"rank":{rank},"title":"title","product":"product name",'
+            f'"hs_code_range":"HS Chapter XX","target_markets":["Country1","Country2"],'
+            f'"initial_investment_inr":"X lakhs","monthly_revenue_potential_inr":"X lakhs",'
+            f'"typical_margin_pct":"X-Y%","difficulty_level":"Easy/Medium/Hard",'
+            f'"why_now":"one sentence","india_advantage":"one sentence",'
+            f'"state_cluster_link":"how this links to detected state cluster",'
+            f'"relevant_schemes":["RoDTEP"],"key_challenge":"one sentence","first_step":"one sentence"}}'
         )
 
-    # ── Call 1: ideas 1-3 ────────────────────────────────────────
-    prompt1 = (
-        "You are a senior Indian trade consultant. "
-        "Generate exactly 3 specific, actionable business ideas for this trader.\n\n"
-        f"{ctx}\n\n"
-        "Rules: Use real INR figures, fit within budget, focus on given industry, "
-        "keep all text fields under 15 words.\n\n"
-        "Return ONLY valid JSON — no markdown, no preamble:\n"
-        "{\n"
-        '  "profile_analysis": "<2-sentence assessment>",\n'
-        '  "most_recommended": 1,\n'
-        '  "ideas": [\n'
-        f"    {_idea_schema(1)},\n"
-        f"    {_idea_schema(2)},\n"
-        f"    {_idea_schema(3)}\n"
-        "  ]\n"
-        "}"
+    p1 = (
+        "You are a senior Indian trade consultant. Generate 3 specific business ideas.\n\n"
+        f"{ctx}\n\nUse real INR figures, fit budget, focus on stated industry.\n\n"
+        "Return ONLY JSON:\n"
+        '{"profile_analysis":"2-sentence assessment","most_recommended":1,"ideas":['
+        f"{_schema(1)},{_schema(2)},{_schema(3)}]}}"
     )
+    r1 = _call_llama(p1, max_tokens=2400)
+    if "error" in r1: return r1
 
-    result1 = _call_llama(prompt1, max_tokens=2200)
-    if "error" in result1:
-        # Fallback: try single-call with just 3 ideas
-        logger.warning("Smart Trade Ideas call 1 failed, returning partial")
-        return result1
-
-    # ── Call 2: ideas 4-5 ────────────────────────────────────────
-    prompt2 = (
-        "You are a senior Indian trade consultant. "
-        "Generate exactly 2 MORE business ideas (ideas 4 and 5 of a 5-idea set).\n\n"
-        f"{ctx}\n\n"
-        "Make these DIFFERENT from common ideas — niche products, value-added, tech-enabled.\n"
-        "Rules: real INR figures, fit within budget, concise fields under 15 words.\n\n"
-        "Return ONLY valid JSON — no markdown, no preamble:\n"
-        "{\n"
-        '  "ideas": [\n'
-        f"    {_idea_schema(4)},\n"
-        f"    {_idea_schema(5)}\n"
-        "  ]\n"
-        "}"
+    p2 = (
+        "Generate 2 MORE niche/value-added trade ideas (ideas 4 and 5).\n\n"
+        f"{ctx}\n\nReturn ONLY JSON:\n"
+        f'{{"ideas":[{_schema(4)},{_schema(5)}]}}'
     )
-
-    result2 = _call_llama(prompt2, max_tokens=1600)
-    ideas2  = result2.get("ideas", []) if "error" not in result2 else []
-
-    all_ideas = result1.get("ideas", []) + ideas2
-    for i, idea in enumerate(all_ideas):
-        idea["rank"] = i + 1
-
+    r2 = _call_llama(p2, max_tokens=1600)
+    ideas2 = r2.get("ideas",[]) if "error" not in r2 else []
+    all_ideas = r1.get("ideas",[]) + ideas2
+    for i, idea in enumerate(all_ideas): idea["rank"] = i+1
     return {
-        "profile_analysis": result1.get("profile_analysis", ""),
-        "most_recommended":  result1.get("most_recommended", 1),
+        "profile_analysis": r1.get("profile_analysis",""),
+        "most_recommended":  r1.get("most_recommended",1),
         "ideas": all_ideas,
     }
 
 
-def find_global_suppliers(product: str, quantity: str, quality: str, origin: str) -> dict:
-    """Find global sourcing options for Indian importers."""
-    origin_clause = f"Preferred origin: {origin}." if origin and origin.lower() != "any" else ""
-    prompt = f"""You are a global sourcing expert for Indian importers. Find top supplier countries.
+# ════════════════════════════════════════════════════════════════════
+# SUPPLIER FINDER — dynamic, world context
+# ════════════════════════════════════════════════════════════════════
 
-Product to Import: {product}
-Quantity: {quantity}
-Quality Standard: {quality}
+def find_global_suppliers(product: str, quantity: str, quality: str, origin: str) -> dict:
+    origin_clause = (
+        f"Preferred origin: {origin}. Prioritize {origin} suppliers."
+        if origin and origin.lower() not in ("any","") else
+        "No origin preference — rank by price, quality, lead time, and FTA benefit with India."
+    )
+    prompt = f"""You are a global sourcing expert for Indian importers.
+
+Product to import into India: {product}
+Quantity: {quantity} | Quality: {quality}
 {origin_clause}
+
+Identify the ACTUAL top 3 source countries for {product}. Use real trade knowledge.
 
 Return ONLY this JSON:
 {{
   "product": "{product}",
-  "global_supply_overview": "2-sentence market overview",
-  "recommended_origin": "best country to source from",
+  "global_supply_overview": "2-sentence factual overview of global supply for {product}",
+  "recommended_origin": "best country with brief reason",
   "top_supply_origins": [
     {{
-      "country": "Country Name",
-      "fob_price_range_usd": "X-Y per unit/MT",
-      "min_order_qty": "X units/MT",
+      "country": "ACTUAL #1 global exporter of {product}",
+      "fob_price_range_usd": "realistic FOB range for {quantity}",
+      "min_order_qty": "typical MOQ",
       "lead_time_weeks": 4,
-      "quality_level": "Premium/Standard/Budget",
-      "bcd_pct": "X%",
-      "igst_pct": "X%",
-      "total_landed_markup_pct": "X%",
-      "fta_with_india": true,
-      "fta_saving": "X% duty saved",
-      "concerns": ["concern 1"],
-      "recommended_incoterm": "FOB/CIF/EXW"
+      "quality_level": "{quality}",
+      "bcd_pct": "India BCD for {product} from this country",
+      "igst_pct": "18%",
+      "total_landed_markup_pct": "estimated % above FOB after India duties",
+      "fta_with_india": false,
+      "fta_saving": null,
+      "concerns": ["real concern for {product} from this country"],
+      "recommended_incoterm": "FOB",
+      "why_recommended": "specific reason this country is best for {product}",
+      "plain_assessment": "1-2 sentence plain English assessment"
     }},
     {{
-      "country": "Country Name",
-      "fob_price_range_usd": "X-Y per unit/MT",
-      "min_order_qty": "X units/MT",
+      "country": "ACTUAL #2 exporter",
+      "fob_price_range_usd": "range",
+      "min_order_qty": "MOQ",
       "lead_time_weeks": 6,
       "quality_level": "Standard",
-      "bcd_pct": "X%",
-      "igst_pct": "X%",
+      "bcd_pct": "India BCD",
+      "igst_pct": "18%",
       "total_landed_markup_pct": "X%",
       "fta_with_india": false,
       "fta_saving": null,
-      "concerns": ["concern 1"],
-      "recommended_incoterm": "FOB"
+      "concerns": ["concern"],
+      "recommended_incoterm": "CIF",
+      "why_recommended": "reason",
+      "plain_assessment": "1-2 sentence plain English"
     }},
     {{
-      "country": "Country Name",
-      "fob_price_range_usd": "X-Y per unit/MT",
-      "min_order_qty": "X units/MT",
+      "country": "ACTUAL #3 option",
+      "fob_price_range_usd": "range",
+      "min_order_qty": "MOQ",
       "lead_time_weeks": 8,
       "quality_level": "Budget",
-      "bcd_pct": "X%",
-      "igst_pct": "X%",
+      "bcd_pct": "India BCD",
+      "igst_pct": "18%",
       "total_landed_markup_pct": "X%",
       "fta_with_india": false,
       "fta_saving": null,
-      "concerns": ["concern 1", "concern 2"],
-      "recommended_incoterm": "FOB"
+      "concerns": ["concern 1","quality risk"],
+      "recommended_incoterm": "FOB",
+      "why_recommended": "reason",
+      "plain_assessment": "1-2 sentence plain English"
     }}
   ],
-  "verification_tips": ["tip 1", "tip 2", "tip 3"],
+  "verification_tips": ["tip 1","tip 2","tip 3"],
+  "plain_summary": "2-3 sentence plain English recommendation on where to source and why",
   "data_confidence": "medium"
 }}"""
-    return _call_llama(prompt, max_tokens=2500)
+    return _call_llama(prompt, max_tokens=3000, use_cache=False)
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -782,130 +635,229 @@ Return ONLY this JSON:
 # ════════════════════════════════════════════════════════════════════
 
 def generate_ai_trade_report(product: str, direction: str, countries: list) -> dict:
-    """Generate a comprehensive trade opportunity report."""
-    countries_str = ", ".join(countries) if countries else "Top 5 global markets"
+    countries_str = ", ".join(countries) if countries else "USA, UAE, Germany"
+    first_country = countries[0] if countries else "USA"
+    state = _detect_state(product)
+    state_note = (
+        f"Indian origin: {state['state'].replace('_',' ').title()} "
+        f"(port: {state.get('main_port','')}, schemes: {state.get('key_schemes','')})."
+    ) if state else ""
+
+    market_entries = []
+    for c in (countries or ["USA","UAE","Germany"]):
+        market_entries.append(
+            f'{{"country":"{c}","import_size_usd_m":500,"india_share_pct":8,'
+            f'"growth_rate_pct":10,"opportunity_score":70,"entry_difficulty":"Medium",'
+            f'"tariff_pct":5,"fta_benefit":"Check applicable FTA",'
+            f'"key_buyers":["Importers","Distributors"],'
+            f'"entry_strategy":"Direct export via trade portal",'
+            f'"plain_note":"1 sentence on this market opportunity"}}'
+        )
+
     prompt = f"""You are a senior Indian trade consultant. Write a comprehensive trade report.
 
 Product: {product}
-Direction: {direction} (India perspective)
+Direction: {direction}
 Target Countries: {countries_str}
+{state_note}
 
-Return ONLY this JSON:
+Return ONLY this JSON. executive_summary MUST be a JSON object.
+
 {{
   "report_title": "Trade Opportunity Report: {product}",
-  "executive_summary": "3-4 sentence overview",
+  "executive_summary": {{
+    "headline_finding": "Most important finding about {product} {direction.lower()} opportunity",
+    "market_opportunity": "Quantified opportunity: market size, growth, India current share",
+    "top_recommendation": "Single most actionable recommendation",
+    "key_risks": ["main risk 1","main risk 2"],
+    "plain_verdict": "1-2 sentence plain English verdict for a trader deciding whether to proceed"
+  }},
   "market_opportunity_score": 72,
-  "india_export_value_2023_usd": "approximate value",
-  "global_market_size_usd": "approximate size",
+  "india_export_value_2023_usd": "approximate annual value",
+  "global_market_size_usd": "global market size",
   "growth_rate_pct": "X%",
-  "target_markets": [
-    {{
-      "country": "Country",
-      "market_size_usd": "size",
-      "india_share_pct": "X%",
-      "import_duty_on_india": "X%",
-      "fta_benefit": "FTA benefit or none",
-      "demand_trend": "Growing/Stable/Declining",
-      "key_buyers": ["buyer type 1", "buyer type 2"],
-      "entry_strategy": "recommended approach"
-    }}
-  ],
+  "market_analysis": [{",".join(market_entries)}],
   "regulatory_snapshot": {{
-    "hs_code": "XXXXXXXX",
-    "export_policy": "Free/Restricted",
-    "key_certifications": ["cert 1", "cert 2"],
-    "documentation": ["doc 1", "doc 2", "doc 3"]
+    "hs_code": "8-digit HS code",
+    "export_policy": "Free",
+    "key_certifications": ["cert 1","cert 2"],
+    "documentation": ["Shipping Bill","Commercial Invoice","Packing List","Certificate of Origin"]
   }},
   "financial_projection": {{
-    "estimated_fob_price_usd": "price",
-    "container_load_value_usd": "value per 20ft container",
+    "estimated_fob_price_usd": "USD X per MT/unit",
+    "container_load_value_usd": "USD X per 20ft container",
     "rodtep_benefit_pct": "X%",
     "estimated_net_margin_pct": "X-Y%"
   }},
   "action_plan": [
-    {{"step": 1, "action": "action", "timeline": "Week 1-2", "authority": "DGFT/APEDA/etc"}},
-    {{"step": 2, "action": "action", "timeline": "Week 3-4", "authority": "authority"}},
-    {{"step": 3, "action": "action", "timeline": "Month 2", "authority": "authority"}},
-    {{"step": 4, "action": "action", "timeline": "Month 3", "authority": "authority"}}
+    {{"week":"1-2","action":"Obtain IEC from DGFT portal","output":"IEC Certificate"}},
+    {{"week":"3-4","action":"Get certifications for {first_country}","output":"Certificates"}},
+    {{"week":"5-8","action":"Register on India Trade Portal and find {first_country} buyers","output":"Qualified leads"}},
+    {{"week":"9-12","action":"Finalise first export order and arrange logistics","output":"First shipment"}}
   ],
-  "risks": ["risk 1", "risk 2", "risk 3"],
+  "risks": ["risk specific to {product}","currency risk","quality/compliance risk"],
+  "plain_summary": "3-4 sentence plain English report summary for a non-expert trader",
   "data_confidence": "medium"
-}}"""
-    return _call_llama(prompt, max_tokens=4000)
+}}
+
+CRITICAL: executive_summary = JSON object. All numeric fields = NUMBERS."""
+    return _call_llama(prompt, max_tokens=4000, use_cache=False)
 
 
 # ════════════════════════════════════════════════════════════════════
-# DOCUMENT ANALYZER
+# DOCUMENT ANALYZER — robust field extraction
 # ════════════════════════════════════════════════════════════════════
 
 def analyze_trade_document(document_text: str) -> dict:
-    """Extract and analyze trade data from a document."""
-    truncated = document_text[:3000]
-    prompt = f"""You are an Indian trade document expert. Analyze this trade document.
+    truncated = document_text[:4500]
+    prompt = f"""You are an expert Indian trade document analyst. Read this document carefully.
 
-Document Content:
+DOCUMENT:
 {truncated}
 
-Extract all relevant trade information. Return ONLY this JSON:
+Extract every field you can find. If a field is genuinely absent, use null.
+DO NOT use placeholder text like "number or null" — extract real values or null.
+
+Field extraction hints:
+- document_number: look for Invoice No, PO No, Order No, BL No, Ref No
+- document_date: look for Date, Dated, Invoice Date, PO Date (format: YYYY-MM-DD)
+- incoterm: look for FOB, CIF, EXW, DAP, CPT, DDP in terms or conditions
+- total_invoice_value.amount: look for Total Amount, Grand Total, Invoice Total (as a number)
+- exporter.name: look for Seller, Shipper, Exporter, From
+- importer.name: look for Buyer, Consignee, Importer, To
+- products: extract each line item
+
+Return ONLY this JSON:
 {{
-  "document_type": "Invoice/Packing List/Bill of Lading/LC/Other",
-  "parties": {{
-    "exporter": "name or unknown",
-    "importer": "name or unknown",
-    "country_of_origin": "country or unknown",
-    "destination_country": "country or unknown"
+  "document_type": "Commercial Invoice or Packing List or Bill of Lading or Purchase Order or Certificate of Origin or Letter of Credit or Other — identify from content",
+  "compliance_status": "OK if complete and valid, Review Needed if missing key fields",
+  "document_number": "actual number from doc or null",
+  "document_date": "YYYY-MM-DD or null",
+  "incoterm": "FOB/CIF/EXW/etc or null",
+  "exporter": {{
+    "name": "actual exporter name from doc or null",
+    "iec_code": "IEC code if present or null",
+    "address": "address if present or null"
   }},
-  "product_details": {{
-    "description": "product description",
-    "hs_code": "HS code if found or null",
-    "quantity": "quantity if found",
-    "unit_price": "price if found",
-    "total_value": "total value if found",
-    "currency": "currency code"
+  "importer": {{
+    "name": "actual importer/buyer name from doc or null",
+    "country": "destination country or null",
+    "address": "address if present or null"
   }},
-  "compliance_flags": ["flag 1 if any"],
-  "missing_information": ["missing field 1", "missing field 2"],
-  "recommendations": ["recommendation 1", "recommendation 2"],
-  "risk_alerts": ["alert 1 if any"],
+  "total_invoice_value": {{
+    "amount": 0.0,
+    "currency": "USD"
+  }},
+  "products": [
+    {{
+      "line_no": "1",
+      "description": "actual product description from doc",
+      "hs_code": "HS code if present or null",
+      "hs_code_valid": true,
+      "quantity": "actual quantity",
+      "unit": "MT/KG/PCS/etc",
+      "unit_price_usd": 0.0,
+      "total_value_usd": 0.0
+    }}
+  ],
+  "flags": [],
+  "missing_critical_fields": [],
+  "compliance_notes": "2-3 sentence plain English assessment: is this document complete and trade-ready? What is present and what is missing?",
   "data_confidence": "high"
-}}"""
-    return _call_llama(prompt, max_tokens=1500)
+}}
+
+IMPORTANT: Extract REAL values from the document above. Never fill placeholder text."""
+    return _call_llama(prompt, max_tokens=2500, use_cache=False)
 
 
 # ════════════════════════════════════════════════════════════════════
 # COMPLIANCE CHECKER
 # ════════════════════════════════════════════════════════════════════
 
-def check_trade_compliance(product: str, origin: str, destination: str, value_usd: float) -> dict:
-    """Check trade compliance requirements for a shipment."""
-    prompt = f"""You are an Indian trade compliance officer. Check compliance requirements.
+def check_trade_compliance(product, origin, destination, value_usd=50000.0):
+    state = _detect_state(product + " " + origin)
+    state_note = (
+        f"Indian origin state: {state['state'].replace('_',' ').title()}. "
+        f"Use port {state.get('main_port','')} and mention relevant state schemes."
+    ) if state else ""
+
+    prompt = f"""You are an Indian trade compliance officer.
 
 Product: {product}
-Origin: {origin}
-Destination: {destination}
-Shipment Value: USD {value_usd}
+Origin: {origin} → Destination: {destination} | Value: USD {value_usd:,.0f}
+{state_note}
 
-Return ONLY this JSON:
+Return ONLY this JSON. checks MUST be a JSON OBJECT (not an array).
+
 {{
-  "compliance_status": "Clear/Review Required/Action Needed",
-  "overall_score": 85,
-  "checks": [
-    {{"check": "Export License", "status": "Pass/Fail/Check", "details": "explanation"}},
-    {{"check": "SCOMET Control", "status": "Pass/Fail/Check", "details": "explanation"}},
-    {{"check": "Sanctions Screening", "status": "Pass/Fail/Check", "details": "explanation"}},
-    {{"check": "Documentation", "status": "Pass/Fail/Check", "details": "explanation"}},
-    {{"check": "FTA Eligibility", "status": "Pass/Fail/Check", "details": "explanation"}}
+  "overall_compliance_status": "CLEAR",
+  "compliance_summary": "Plain English: is this trade clear to proceed, any restrictions?",
+  "checks": {{
+    "scomet_control": {{"status": "CLEAR", "detail": "plain English SCOMET assessment"}},
+    "dgft_policy": {{"status": "CLEAR", "detail": "plain English DGFT policy status"}},
+    "un_sanctions": {{"status": "CLEAR", "detail": "plain English sanctions check for {destination}"}},
+    "prohibited_items": {{"status": "CLEAR", "detail": "plain English prohibited goods check"}},
+    "licence_required": {{"status": "NOT REQUIRED", "detail": "plain English licence requirement"}},
+    "quality_standards": {{"status": "OK", "detail": "plain English quality/cert requirements for {destination}"}}
+  }},
+  "required_documents": [
+    "Shipping Bill / Bill of Entry",
+    "Commercial Invoice",
+    "Packing List",
+    "Certificate of Origin",
+    "product-specific certificate if required"
   ],
-  "required_documents": ["document 1", "document 2", "document 3"],
+  "recommended_next_steps": [
+    "Step 1: specific action for {product} to {destination}",
+    "Step 2: documentation preparation",
+    "Step 3: regulatory filing"
+  ],
+  "state_port_recommendation": "which port to use and why based on origin state",
   "duties_estimate": {{
     "bcd_pct": "X%",
     "igst_pct": "X%",
-    "total_duty_usd": "approximate amount"
+    "total_duty_usd": "USD estimate"
   }},
-  "action_items": ["action 1", "action 2"],
+  "plain_summary": "2-3 sentence plain English bottom line: can this trade proceed, what to watch out for?",
   "data_confidence": "medium"
+}}
+
+CRITICAL: checks = JSON OBJECT with 6 keys. overall_compliance_status = CLEAR/CONDITIONAL/BLOCKED."""
+    return _call_llama(prompt, max_tokens=2000, use_cache=False)
+
+
+# ════════════════════════════════════════════════════════════════════
+# HS CODE ENGINE
+# ════════════════════════════════════════════════════════════════════
+
+def classify_hs_code(product: str) -> dict:
+    state = _detect_state(product)
+    state_note = (
+        f"Product likely from {state['state'].replace('_',' ').title()} — "
+        f"classify using state-typical product specifications."
+    ) if state else ""
+
+    prompt = f"""You are an ITC-HS 2022 classification expert.
+
+Product: {product}
+{state_note}
+
+Return ONLY valid JSON:
+{{
+  "hs_code": "8-digit ITC-HS 2022 code",
+  "hs_description": "official ITC-HS description",
+  "chapter_no": "XX",
+  "chapter_name": "chapter name",
+  "bcd": "X%",
+  "igst": "X%",
+  "total_import_burden_pct": "X%",
+  "rodtep_rate": "X% or N/A",
+  "scomet_restricted": false,
+  "confidence": 0.92,
+  "classification_rationale": "plain English explanation of why this HS code applies",
+  "validation_warning": null
 }}"""
-    return _call_llama(prompt, max_tokens=1500)
+    return _call_llama(prompt, max_tokens=1000)
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -913,496 +865,8 @@ Return ONLY this JSON:
 # ════════════════════════════════════════════════════════════════════
 
 def health_check() -> dict:
-    """Test connectivity to NVIDIA API. Returns status dict."""
     try:
-        result = _call_llama(
-            'Return ONLY this JSON: {"status":"ok","model":"llama-3.3-70b"}',
-            retries=0,
-            use_cache=False,
-        )
-        if "error" in result:
-            return {"status": "error", "message": result["error"]}
-        return {"status": "ok", "model": MODEL, "api_url": API_URL}
+        r = _call_llama('{"status":"ok"}', retries=1, use_cache=False)
+        return {"status":"ok","model":MODEL} if "error" not in r else {"status":"error","message":r["error"]}
     except Exception as e:
-        return {"status": "error", "message": str(e)}
-"""
-document_scanner.py
-──────────────────────────────────────────────────────────────────────
-Document Scanning Pipeline for Indian Trade Intelligence Engine
-Supports: PDF, PNG, JPG, JPEG
-
-Extraction strategies (in order):
-  1. pdfplumber        — selectable-text PDFs + tables
-  2. PyMuPDF text      — selectable-text fallback
-  3. PyMuPDF blocks    — raw character extraction (embedded fonts)
-  4. Render + OCR      — scanned PDFs (needs Tesseract binary)
-
-Install Python libs:  pip install pdfplumber pymupdf pytesseract Pillow
-Tesseract binary:
-  Windows : https://github.com/UB-Mannheim/tesseract/wiki
-  Ubuntu  : sudo apt-get install tesseract-ocr
-  macOS   : brew install tesseract
-
-Strategies 1-3 work WITHOUT Tesseract for native PDFs.
-──────────────────────────────────────────────────────────────────────
-"""
-
-import io
-import os
-import re
-import logging
-import shutil
-from pathlib import Path
-
-logger = logging.getLogger("document_scanner")
-
-
-def _configure_tesseract() -> bool:
-    """
-    Auto-detect and configure Tesseract binary path.
-    Checks PATH first, then common installation directories.
-    Returns True if Tesseract is found and configured.
-    """
-    try:
-        import pytesseract
-
-        # 1. Check if already on PATH
-        if shutil.which("tesseract"):
-            return True
-
-        # 2. Check common Windows install paths
-        win_paths = [
-            r"C:\Program Files\Tesseract-OCR\tesseract.exe",
-            r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
-            os.path.expanduser(r"~\AppData\Local\Tesseract-OCR\tesseract.exe"),
-            r"C:\tools\Tesseract-OCR\tesseract.exe",
-        ]
-        for path in win_paths:
-            if os.path.isfile(path):
-                pytesseract.pytesseract.tesseract_cmd = path
-                logger.info(f"Tesseract found at: {path}")
-                return True
-
-        # 3. Check common Linux/macOS paths
-        unix_paths = [
-            "/usr/bin/tesseract",
-            "/usr/local/bin/tesseract",
-            "/opt/homebrew/bin/tesseract",   # macOS Homebrew on Apple Silicon
-            "/opt/local/bin/tesseract",       # macOS MacPorts
-        ]
-        for path in unix_paths:
-            if os.path.isfile(path):
-                pytesseract.pytesseract.tesseract_cmd = path
-                logger.info(f"Tesseract found at: {path}")
-                return True
-
-        # 4. Check TESSERACT_CMD environment variable (set in .env file)
-        env_path = os.environ.get("TESSERACT_CMD", "")
-        if env_path and os.path.isfile(env_path):
-            pytesseract.pytesseract.tesseract_cmd = env_path
-            logger.info(f"Tesseract from TESSERACT_CMD env: {env_path}")
-            return True
-
-        # 5. Try loading from .env file directly (streamlit may not load it)
-        try:
-            env_file = Path(".env")
-            if env_file.exists():
-                for line in env_file.read_text().splitlines():
-                    if line.startswith("TESSERACT_CMD="):
-                        env_cmd = line.split("=", 1)[1].strip().strip('"').strip("'")
-                        if env_cmd and os.path.isfile(env_cmd):
-                            pytesseract.pytesseract.tesseract_cmd = env_cmd
-                            logger.info(f"Tesseract from .env file: {env_cmd}")
-                            return True
-        except Exception:
-            pass
-
-        logger.warning(
-            "Tesseract binary not found. Install from https://github.com/UB-Mannheim/tesseract/wiki "
-            "or set TESSERACT_CMD=<path> in your .env file"
-        )
-        return False
-
-    except ImportError:
-        return False
-
-
-# Configure Tesseract at module import time
-_TESSERACT_AVAILABLE = _configure_tesseract()
-
-SUPPORTED_FORMATS = ["pdf", "png", "jpg", "jpeg"]
-
-
-def _try_import(module_name: str):
-    try:
-        import importlib
-        return importlib.import_module(module_name)
-    except ImportError:
-        return None
-
-
-# ════════════════════════════════════════════════════════════════════
-# TEXT CLEANING
-# ════════════════════════════════════════════════════════════════════
-
-def _clean_extracted_text(raw: str) -> str:
-    if not raw:
-        return ""
-    text = raw.replace("\r\n", "\n").replace("\r", "\n")
-    text = text.replace("\f", "\n--- PAGE BREAK ---\n")
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    text = re.sub(r"(?<=\d)O(?=\d)", "0", text)
-    text = text.replace("\x00", "")
-    return text.strip()
-
-
-# ════════════════════════════════════════════════════════════════════
-# PDF STRATEGIES
-# ════════════════════════════════════════════════════════════════════
-
-def _strategy1_pdfplumber(file_bytes: bytes):
-    pdfplumber = _try_import("pdfplumber")
-    if not pdfplumber:
-        raise ImportError("pdfplumber not installed")
-    with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
-        pages = []
-        for i, page in enumerate(pdf.pages):
-            page_text = page.extract_text() or ""
-            tables = page.extract_tables() or []
-            table_text = ""
-            for table in tables:
-                for row in table:
-                    if row:
-                        row_clean = [str(c).strip() if c else "" for c in row]
-                        table_text += "  |  ".join(row_clean) + "\n"
-            combined = page_text
-            if table_text and table_text not in page_text:
-                combined = page_text + "\n" + table_text
-            if combined.strip():
-                pages.append(f"[Page {i+1}]\n{combined}")
-        return "\n\n".join(pages), len(pdf.pages)
-
-
-def _strategy2_pymupdf_text(file_bytes: bytes):
-    fitz = _try_import("fitz")
-    if not fitz:
-        raise ImportError("PyMuPDF not installed")
-    doc = fitz.open(stream=file_bytes, filetype="pdf")
-    pages = []
-    for i, page in enumerate(doc):
-        text = page.get_text("text")
-        if text.strip():
-            pages.append(f"[Page {i+1}]\n{text}")
-    n = len(doc)
-    doc.close()
-    return "\n\n".join(pages), n
-
-
-def _strategy3_pymupdf_blocks(file_bytes: bytes):
-    fitz = _try_import("fitz")
-    if not fitz:
-        raise ImportError("PyMuPDF not installed")
-    doc = fitz.open(stream=file_bytes, filetype="pdf")
-    pages = []
-    for i, page in enumerate(doc):
-        blocks = page.get_text("blocks")
-        lines = [b[4].strip() for b in blocks if len(b) >= 5 and b[4].strip()]
-        if lines:
-            pages.append(f"[Page {i+1}]\n" + "\n".join(lines))
-    n = len(doc)
-    doc.close()
-    return "\n\n".join(pages), n
-
-
-def _strategy4_render_ocr(file_bytes: bytes, enhance: bool = True):
-    # Ensure Tesseract is configured (re-check in case binary was added after startup)
-    if not _TESSERACT_AVAILABLE:
-        _configure_tesseract()
-
-    fitz = _try_import("fitz")
-    if not fitz:
-        raise ImportError("PyMuPDF required for scanned PDF OCR")
-
-    pytesseract = _try_import("pytesseract")
-    if not pytesseract:
-        raise ImportError(
-            "pytesseract not installed. Run: pip install pytesseract\n"
-            "Also install Tesseract binary:\n"
-            "  Windows: https://github.com/UB-Mannheim/tesseract/wiki\n"
-            "  Ubuntu:  sudo apt-get install tesseract-ocr"
-        )
-
-    try:
-        pytesseract.get_tesseract_version()
-    except Exception:
-        raise RuntimeError(
-            "Tesseract binary not found on your system.\n"
-            "pip install pytesseract only installs the Python wrapper.\n"
-            "You must also install the Tesseract engine:\n"
-            "  Windows: https://github.com/UB-Mannheim/tesseract/wiki\n"
-            "    (download .exe, install, add C:\\Program Files\\Tesseract-OCR\\ to PATH)\n"
-            "  Ubuntu/WSL: sudo apt-get install tesseract-ocr\n"
-            "  macOS: brew install tesseract\n"
-            "Then restart your terminal and run: streamlit run app.py"
-        )
-
-    PIL_mod = _try_import("PIL.Image")
-    doc = fitz.open(stream=file_bytes, filetype="pdf")
-    pages = []
-    for i, page in enumerate(doc):
-        mat = fitz.Matrix(3.0, 3.0)  # 216 DPI
-        pix = page.get_pixmap(matrix=mat, alpha=False)
-        img_bytes = pix.tobytes("png")
-
-        if PIL_mod and enhance:
-            from PIL import Image as _PIL, ImageFilter, ImageEnhance
-            img = _PIL.open(io.BytesIO(img_bytes)).convert("L")
-            img = img.filter(ImageFilter.SHARPEN)
-            img = ImageEnhance.Contrast(img).enhance(1.5)
-            buf = io.BytesIO()
-            img.save(buf, format="PNG")
-            img_bytes = buf.getvalue()
-
-        from PIL import Image as _PIL_raw
-        text = pytesseract.image_to_string(
-            _PIL_raw.open(io.BytesIO(img_bytes)),
-            config="--oem 3 --psm 6",
-            lang="eng",
-        )
-        if text.strip():
-            pages.append(f"[Page {i+1}]\n{text}")
-
-    n = len(doc)
-    doc.close()
-    return "\n\n".join(pages), n
-
-
-def _extract_pdf(file_bytes: bytes, enhance: bool = True):
-    errors = []
-
-    for strategy_name, strategy_fn in [
-        ("pdfplumber",    lambda: _strategy1_pdfplumber(file_bytes)),
-        ("PyMuPDF text",  lambda: _strategy2_pymupdf_text(file_bytes)),
-        ("PyMuPDF blocks",lambda: _strategy3_pymupdf_blocks(file_bytes)),
-    ]:
-        try:
-            text, pages = strategy_fn()
-            if len(text.strip()) > 50:
-                logger.info(f"PDF extracted via {strategy_name}: {len(text)} chars, {pages} pages")
-                return text, pages
-            else:
-                logger.debug(f"{strategy_name} returned <50 chars, trying next")
-        except Exception as e:
-            errors.append(f"{strategy_name}: {e}")
-            logger.warning(f"{strategy_name} failed: {e}")
-
-    # Strategy 4: OCR — raises RuntimeError with clear Tesseract message
-    try:
-        text, pages = _strategy4_render_ocr(file_bytes, enhance=enhance)
-        if len(text.strip()) > 10:
-            logger.info(f"PDF extracted via render+OCR: {len(text)} chars, {pages} pages")
-            return text, pages
-    except (RuntimeError, ImportError):
-        raise  # Surface Tesseract error directly
-    except Exception as e:
-        errors.append(f"OCR: {e}")
-        logger.warning(f"PDF OCR failed: {e}")
-
-    raise RuntimeError(
-        "All PDF extraction methods failed. "
-        "Install: pip install pdfplumber pymupdf pytesseract | "
-        + " | ".join(errors)
-    )
-
-
-# ════════════════════════════════════════════════════════════════════
-# IMAGE EXTRACTION
-# ════════════════════════════════════════════════════════════════════
-
-def _extract_image(file_bytes: bytes, enhance: bool = True):
-    pytesseract = _try_import("pytesseract")
-    PIL_mod = _try_import("PIL.Image")
-
-    if not pytesseract:
-        raise ImportError("pytesseract not installed. Run: pip install pytesseract")
-    if not PIL_mod:
-        raise ImportError("Pillow not installed. Run: pip install Pillow")
-
-    try:
-        pytesseract.get_tesseract_version()
-    except Exception:
-        raise RuntimeError(
-            "Tesseract binary not found.\n"
-            "  Windows: https://github.com/UB-Mannheim/tesseract/wiki\n"
-            "  Ubuntu:  sudo apt-get install tesseract-ocr"
-        )
-
-    from PIL import Image as _PIL, ImageFilter, ImageEnhance
-    img = _PIL.open(io.BytesIO(file_bytes)).convert("RGB")
-
-    if enhance:
-        img = img.convert("L")
-        w, h = img.size
-        if w < 1000 or h < 1000:
-            scale = max(1000 / w, 1000 / h, 1.0)
-            img = img.resize((int(w * scale), int(h * scale)), _PIL.LANCZOS)
-        img = img.filter(ImageFilter.SHARPEN)
-        img = ImageEnhance.Contrast(img).enhance(1.8)
-        img = ImageEnhance.Brightness(img).enhance(1.1)
-
-    text = pytesseract.image_to_string(img, config="--oem 3 --psm 6", lang="eng")
-    return text, 1
-
-
-# ════════════════════════════════════════════════════════════════════
-# PUBLIC API
-# ════════════════════════════════════════════════════════════════════
-
-TESSERACT_INSTALL_GUIDE = """
-⚠️  Tesseract binary not found on your system.
-
-pip install pytesseract  ← Python wrapper ONLY, does NOT install the OCR engine
-
-INSTALL TESSERACT BINARY:
-
-📥 Windows (most common fix):
-   1. Download installer: https://github.com/UB-Mannheim/tesseract/wiki
-      → Download: tesseract-ocr-w64-setup-5.x.x.exe
-   2. During install: CHECK "Add to PATH" (important!)
-   3. Default install path: C:\\Program Files\\Tesseract-OCR\\
-   4. After install: CLOSE and REOPEN your terminal/PowerShell
-   5. Verify: tesseract --version  (should show version number)
-   6. If still not found: set env variable TESSERACT_CMD=C:\\Program Files\\Tesseract-OCR\\tesseract.exe
-
-📥 Ubuntu / WSL:
-   sudo apt-get update && sudo apt-get install -y tesseract-ocr
-   sudo apt-get install -y tesseract-ocr-eng  (English language pack)
-
-📥 macOS:
-   brew install tesseract
-
-After install: restart terminal → streamlit run app.py
-"""
-
-
-def scan_document(file_bytes: bytes, filename: str, enhance: bool = True,
-                   force_ocr: bool = False) -> dict:
-    """
-    Scan and extract text from an uploaded document.
-
-    Args:
-      force_ocr: Skip text-layer extraction entirely and render pages as images
-                 before OCR. Use for image-based PDFs where pdfplumber/PyMuPDF
-                 return blank or garbled text.
-
-    Returns dict:
-      status       : "success" | "error"
-      text         : extracted cleaned text
-      char_count   : int
-      pages        : int
-      format       : "pdf" | "image"
-      method       : extraction method used
-      message      : error description if status == "error"
-      install_hint : install instructions if dependency missing
-    """
-    if not file_bytes:
-        return {"status": "error", "message": "No file data received.",
-                "text": "", "char_count": 0, "pages": 0}
-
-    ext = Path(filename).suffix.lower().lstrip(".")
-    if ext not in SUPPORTED_FORMATS:
-        return {"status": "error",
-                "message": f"Unsupported format '.{ext}'. Supported: {', '.join(SUPPORTED_FORMATS)}",
-                "text": "", "char_count": 0, "pages": 0}
-
-    try:
-        if ext == "pdf":
-            if force_ocr:
-                # Skip text extraction — go straight to render+OCR for image PDFs
-                raw_text, num_pages = _strategy4_render_ocr(file_bytes, enhance=enhance)
-                fmt, method = "pdf", "forced-ocr"
-            else:
-                raw_text, num_pages = _extract_pdf(file_bytes, enhance=enhance)
-                fmt, method = "pdf", "pdf-extraction"
-        else:
-            raw_text, num_pages = _extract_image(file_bytes, enhance=enhance)
-            fmt, method = "image", "ocr"
-
-        clean_text = _clean_extracted_text(raw_text)
-
-        if not clean_text.strip():
-            return {"status": "error",
-                    "message": "No text extracted. Document may be blank, encrypted, or too low quality.",
-                    "text": "", "char_count": 0, "pages": num_pages,
-                    "format": fmt, "method": method}
-
-        return {"status": "success", "text": clean_text,
-                "char_count": len(clean_text), "pages": num_pages,
-                "format": fmt, "method": method, "message": ""}
-
-    except RuntimeError as e:
-        err = str(e)
-        logger.error(f"Scan error '{filename}': {err}")
-        is_tesseract = "Tesseract" in err or "tesseract" in err
-        if is_tesseract:
-            # Try one more time to auto-configure path
-            if _configure_tesseract():
-                try:
-                    if ext == "pdf":
-                        raw_text, num_pages = _strategy4_render_ocr(file_bytes, enhance=enhance)
-                    else:
-                        raw_text, num_pages = _extract_image(file_bytes, enhance=enhance)
-                    clean_text = _clean_extracted_text(raw_text)
-                    if clean_text.strip():
-                        return {"status": "success", "text": clean_text,
-                                "char_count": len(clean_text), "pages": num_pages,
-                                "format": ext, "method": "ocr-retry", "message": ""}
-                except Exception:
-                    pass
-        return {"status": "error", "message": err,
-                "install_hint": TESSERACT_INSTALL_GUIDE if is_tesseract else None,
-                "text": "", "char_count": 0, "pages": 0}
-
-    except ImportError as e:
-        missing = str(e)
-        hints = {"pytesseract": "pip install pytesseract",
-                 "pdfplumber":  "pip install pdfplumber",
-                 "fitz":        "pip install pymupdf",
-                 "Pillow":      "pip install Pillow"}
-        hint = next((v for k, v in hints.items() if k in missing), f"pip install ...")
-        logger.error(f"Missing lib: {missing}")
-        return {"status": "error", "message": f"Library missing: {missing}",
-                "install_hint": hint, "text": "", "char_count": 0, "pages": 0}
-
-    except Exception as e:
-        logger.error(f"Scan error '{filename}': {e}", exc_info=True)
-        return {"status": "error", "message": f"Scanning failed: {e}",
-                "text": "", "char_count": 0, "pages": 0}
-
-
-def get_scanner_status() -> dict:
-    """Return which scanning libraries and binaries are available."""
-    pytesseract = _try_import("pytesseract")
-    tesseract_binary = False
-    tesseract_version = "not found"
-    if pytesseract:
-        try:
-            tesseract_version = str(pytesseract.get_tesseract_version())
-            tesseract_binary = True
-        except Exception:
-            pass
-
-    return {
-        "pdfplumber":        _try_import("pdfplumber") is not None,
-        "pymupdf":           _try_import("fitz") is not None,
-        "pytesseract_pkg":   pytesseract is not None,
-        "tesseract_binary":  tesseract_binary,
-        "tesseract_version": tesseract_version,
-        "pillow":            _try_import("PIL") is not None,
-        "supported_formats": SUPPORTED_FORMATS,
-        "note": (
-            "Strategies 1-3 (pdfplumber, PyMuPDF text, PyMuPDF blocks) work WITHOUT Tesseract "
-            "for PDFs with a native text layer. "
-            "Tesseract binary is only needed for fully scanned/image PDFs and image files."
-        ),
-    }
+        return {"status":"error","message":str(e)}
