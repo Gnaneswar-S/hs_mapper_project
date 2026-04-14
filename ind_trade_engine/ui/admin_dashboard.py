@@ -12,14 +12,14 @@ import plotly.express as px
 import pandas as pd
 from datetime import datetime, timedelta, timezone
 
-from supabase_service import (
+from services.supabase_service import (
     supabase,
     get_all_users,
     get_all_queries,
     get_platform_stats,
     update_user_role,
 )
-from support_service import (
+from services.support_service import (
     get_all_tickets,
     get_ticket_stats,
     update_ticket_status,

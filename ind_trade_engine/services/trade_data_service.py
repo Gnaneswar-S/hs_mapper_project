@@ -12,7 +12,7 @@ import os
 import json
 from html.parser import HTMLParser
 from datetime import datetime
-from supabase_service import supabase as _supabase_client
+from services.supabase_service import supabase as _supabase_client
 
 
 # ─────────────────────────────────────────

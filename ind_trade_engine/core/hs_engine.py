@@ -17,7 +17,7 @@ import os
 import sys
 import json
 from pathlib import Path
-from nvidia_service import _call_llama
+from services.nvidia_service import _call_llama
 
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
 

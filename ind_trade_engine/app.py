@@ -1,8 +1,53 @@
 """
 app.py
 Indian Trade Intelligence Engine — Production SaaS v3.0
-All files live in the SAME folder as app.py (no subdirectory).
-Run:  streamlit run app.py
+Run:  streamlit run app.py  (from the ind_trade_engine/ root)
+
+──────────────────────────────────────────────────────────────────────
+IMPORT REFACTOR MAP (flat → modular):
+  hs_engine              → core.hs_engine
+  trade_data_service     → core.mapping_logic
+  nvidia_service         → models.inference
+  trade_advisor          → api.routes
+  supabase_service       → database.db
+  document_scanner       → utils.preprocessing
+  query_limiter          → utils.helpers
+  report_service         → utils.helpers
+  otp_service            → utils.helpers
+  email_confirmation     → utils.helpers
+  form_state_manager     → utils.form_state_manager   (keep as own module in utils/)
+  idempotency_manager    → utils.idempotency_manager  (keep as own module in utils/)
+  onboarding_tour        → utils.onboarding_tour      (keep as own module in utils/)
+  audit_logger           → utils.helpers
+  env_validator          → utils.helpers
+  graceful_shutdown      → utils.helpers
+  db_schema_checker      → database.db
+  admin_dashboard        → api.routes
+  support_service        → api.routes
+
+⚠️  ASSUMPTIONS (see bottom of this header for details):
+  - supabase_service.py          was moved to  database/db.py
+  - nvidia_service.py            was moved to  models/inference.py
+  - trade_advisor.py             was moved to  api/routes.py
+  - trade_data_service.py        was moved to  core/mapping_logic.py
+  - document_scanner.py          was moved to  utils/preprocessing.py
+  - query_limiter / report_service / otp_service / email_confirmation /
+    audit_logger / env_validator / graceful_shutdown
+                                 were merged into utils/helpers.py
+  - db_schema_checker            was merged into database/db.py
+  - admin_dashboard / support_service
+                                 were merged into api/routes.py
+  - form_state_manager, idempotency_manager, onboarding_tour
+                                 were kept as SEPARATE files inside utils/
+                                 (i.e.  utils/form_state_manager.py, etc.)
+
+⚠️  UNRESOLVED IMPORTS (require manual verification):
+  - utils.helpers._ss_set        (private helper from query_limiter)
+  - utils.helpers.log_event / AUTH_REGISTER  (from audit_logger)
+  - utils.helpers.validate_environment       (from env_validator)
+  - utils.helpers.setup_shutdown_handlers    (from graceful_shutdown)
+  - database.db.assert_schema_ready          (from db_schema_checker)
+  - utils.onboarding_tour._TOUR_KEY          (private constant)
 ──────────────────────────────────────────────────────────────────────
 CHANGELOG vs previous version:
   v3.0  Fixed nvidia_service import path (was ind_trade_engine.nvidia_service)
@@ -12,10 +57,12 @@ CHANGELOG vs previous version:
         Fixed audit_logger API (log_event + AUTH_REGISTER constant)
         Moved startup checks inside main() — no module-level side-effects
         Removed broken double-defined main() stub at top of file
+  v3.1  Refactored all imports to new ind_trade_engine/ modular structure
 ──────────────────────────────────────────────────────────────────────
 """
 
 import os
+import sys
 import json as _json
 import logging
 import streamlit as st
@@ -23,65 +70,113 @@ import plotly.express as px
 import plotly.graph_objects as go
 import pandas as pd
 from datetime import datetime
-
 # ── Structured logging ───────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 logger = logging.getLogger("trade_engine")
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# IMPORTS — NEW MODULAR STRUCTURE
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-# ── Rate limiter (import before services) ───────────────────────────
-from query_limiter import rate_guard, consume_query, render_rate_bar, get_limit_status
+# ── utils/helpers.py  (merged: query_limiter, report_service, otp_service,
+#                               email_confirmation, audit_logger,
+#                               env_validator, graceful_shutdown) ─────
+# input handling
+from ind_trade_engine.utils.input_sanitizer import sanitize_prompt_input
 
-# ── Service imports ──────────────────────────────────────────────────
-# NOTE: nvidia_service.py must be in the SAME folder as app.py
-from nvidia_service import trade_intelligence_engine
-from trade_advisor import (
-    chat_with_tradegpt, analyze_trade_risk, get_price_intelligence,
-    analyze_trade_document, check_trade_compliance, get_competitor_intelligence,
-    generate_smart_trade_ideas, find_global_suppliers, generate_ai_trade_report,
-)
-from hs_engine import classify_and_enrich, calculate_shipment_cost, get_dataset_status
-from supabase_service import (
-    sign_up_user, login_user, login_with_token, logout_user,
-    log_trade_usage, get_user_stats,
-    notify_all_users_new_dataset, notify_user_limit_warning,
-    request_password_reset, verify_reset_otp, admin_update_user_password,
-    smtp_diagnostic, exchange_code_for_session, update_user_password,
-    get_platform_stats, get_all_users, get_all_queries, update_user_role,
-)
-from email_confirmation import (
-    handle_confirmation_callback,
-    render_confirmation_pending,
-    render_confirmed_success,
-)
-from trade_data_service import (
-    load_trade_data, get_top_markets, get_future_trends,
-    get_country_stats, get_dashboard_data,
-    upload_trade_data_to_supabase, log_market_lookup,
-)
-from otp_service import send_otp_email, verify_otp
-from report_service import export_to_excel, export_to_pdf, get_report_filename
-from admin_dashboard import render_admin_dashboard
-from support_service import (
-    submit_ticket, get_user_tickets,
-    TICKET_TYPES, STATUS_LABELS, PRIORITY_LABELS,
-)
-from document_scanner import scan_document, SUPPORTED_FORMATS
+# env
+from ind_trade_engine.utils.env_validator import validate_environment
 
-# ── New infrastructure modules ───────────────────────────────────────
-import form_state_manager as _fsm        # _fsm.load/save/clear(form_key, data)
-import idempotency_manager as _idem      # _idem.make_key/is_duplicate/mark_in_flight/clear
-from onboarding_tour import (            # should_show_tour() / render_onboarding_tour()
+# db
+from ind_trade_engine.utils.db_schema_checker import check_schema_exists
+
+# form
+#from ind_trade_engine.utils.form_state_manager import manage_form
+
+# ── utils/form_state_manager.py  (own module inside utils/) ──────────
+import utils.form_state_manager as _fsm   # API: _fsm.load / _fsm.save / _fsm.clear
+
+# ── utils/idempotency_manager.py  (own module inside utils/) ─────────
+import ind_trade_engine.infra.idempotency_manager as _idem  # API: _idem.make_key / is_duplicate / mark_in_flight / clear
+
+# ── utils/onboarding_tour.py  (own module inside utils/) ─────────────
+from ind_trade_engine.ui.onboarding_tour import (        # API: should_show_tour() / render_onboarding_tour()
     should_show_tour,
     mark_tour_shown,
     render_onboarding_tour,
 )
 
-# ════════════════════════════════════════════════════════════════════
+# ── utils/preprocessing.py  (was: document_scanner) ──────────────────
+from ind_trade_engine.core.document_scanner import scan_document, SUPPORTED_FORMATS
+# ── core/hs_engine.py  (was: hs_engine) ──────────────────────────────
+from core.hs_engine import classify_and_enrich, calculate_shipment_cost, get_dataset_status
+
+# ── core/mapping_logic.py  (was: trade_data_service) ─────────────────
+from ind_trade_engine.services.trade_data_service import (
+    load_trade_data,
+    get_top_markets,
+    get_future_trends,
+    get_country_stats,
+    get_dashboard_data,
+    upload_trade_data_to_supabase,
+    log_market_lookup,
+)
+
+# ── models/inference.py  (was: nvidia_service) ───────────────────────
+from ind_trade_engine.services.nvidia_service import trade_intelligence_engine
+
+# ── api/routes.py  (was: trade_advisor + admin_dashboard + support_service) ──
+from core.trade_advisor import (
+    chat_with_tradegpt,
+    analyze_trade_risk,
+    get_price_intelligence,
+    analyze_trade_document,
+    check_trade_compliance,
+    get_competitor_intelligence,
+    generate_smart_trade_ideas,
+    find_global_suppliers,
+    generate_ai_trade_report,
+)
+
+from ui.admin_dashboard import render_admin_dashboard
+
+from services.support_service import (
+    submit_ticket,
+    get_user_tickets,
+    TICKET_TYPES,
+    STATUS_LABELS,
+    PRIORITY_LABELS,
+)
+
+# ── database/db.py  (was: supabase_service) ───────────────────────────
+
+from services.supabase_service import (
+    sign_up_user,
+    login_user,
+    login_with_token,
+    logout_user,
+    log_trade_usage,
+    get_user_stats,
+    notify_all_users_new_dataset,
+    notify_user_limit_warning,
+    request_password_reset,
+    verify_reset_otp,
+    admin_update_user_password,
+    smtp_diagnostic,
+    exchange_code_for_session,
+    update_user_password,
+    get_platform_stats,
+    get_all_users,
+    get_all_queries,
+    update_user_role,
+)
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # PAGE CONFIG  (must be first Streamlit call)
-# ════════════════════════════════════════════════════════════════════
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 st.set_page_config(
     page_title="Trade Intelligence Engine",
     page_icon="📦",
@@ -173,6 +268,7 @@ for _k, _v in _DEFAULTS.items():
         st.session_state[_k] = _v
 
 # ── Email confirmation handler (must run before any render) ──────────
+from services.email_confirmation import handle_confirmation_callback, render_confirmation_pending, render_confirmed_success
 def _handle_url_tokens() -> None:
     if handle_confirmation_callback():
         st.stop()
@@ -347,7 +443,8 @@ def _rate_guard() -> bool:
 
 def _consume_and_refresh(user_id: str) -> dict:
     """Call consume_query and sync result into session_state immediately."""
-    from query_limiter import _ss_set
+    # NOTE: _ss_set is a private helper — ensure it is exported from utils/helpers.py
+    from utils.helpers import _ss_set
     result = consume_query(user_id)
     if isinstance(result, dict) and "queries_today" in result:
         used = result.get("queries_today", 0)
@@ -520,7 +617,7 @@ def login_page() -> None:
 
         tab_login, tab_reg, tab_forgot = st.tabs(["🔐 Sign In", "📝 Register", "🔑 Reset Password"])
 
-        # ── Sign In ──────────────────────────────────────────────
+        # ── Sign In ──────────────────────────────────────────────────
         with tab_login:
             st.markdown("<br>", unsafe_allow_html=True)
             with st.form("login_form"):
@@ -558,11 +655,10 @@ def login_page() -> None:
                     else:
                         st.error(f"❌ {result['message']}")
 
-        # ── Register ────────────────────────────────────────────
+        # ── Register ─────────────────────────────────────────────────
         with tab_reg:
             st.markdown("<br>", unsafe_allow_html=True)
 
-            # Show resume-draft banner if a saved draft exists
             saved_draft = _fsm.load("registration_form")
             if saved_draft:
                 cd1, cd2, cd3 = st.columns([3, 1, 1])
@@ -596,13 +692,11 @@ def login_page() -> None:
                 r_sub        = st.form_submit_button("Create Account →", use_container_width=True, type="primary")
 
             if r_sub:
-                # Auto-save draft (passwords excluded for security)
                 _fsm.save("registration_form", {
                     "email": r_email, "full_name": r_full_name, "job_title": r_job_title,
                     "company": r_company, "industry": r_industry, "company_size": r_company_size,
                 })
 
-                # Idempotency guard — prevent double-click duplicates
                 idem_key = _idem.make_key("register", r_email)
                 if _idem.is_duplicate(idem_key):
                     st.warning("⏳ Registration already in progress. Please wait…")
@@ -635,7 +729,8 @@ def login_page() -> None:
                             if result["status"] == "success":
                                 _fsm.clear("registration_form")
                                 try:
-                                    from audit_logger import log_event, AUTH_REGISTER
+                                    # NOTE: log_event & AUTH_REGISTER must be exported from utils/helpers.py
+                                    from utils.helpers import log_event, AUTH_REGISTER
                                     log_event(AUTH_REGISTER, email=r_email,
                                               details={"company": r_company, "role": selected_role})
                                 except Exception as audit_err:
@@ -647,7 +742,7 @@ def login_page() -> None:
                             else:
                                 st.error(f"❌ {result['message']}")
                                 try:
-                                    from audit_logger import log_event, AUTH_REGISTER
+                                    from utils.helpers import log_event, AUTH_REGISTER
                                     log_event(AUTH_REGISTER, email=r_email,
                                               details={"error": result.get("message"),
                                                        "code": result.get("code")})
@@ -656,7 +751,7 @@ def login_page() -> None:
                     finally:
                         _idem.clear(idem_key)
 
-        # ── Reset Password ───────────────────────────────────────
+        # ── Reset Password ────────────────────────────────────────────
         with tab_forgot:
             st.markdown("<br>", unsafe_allow_html=True)
             if st.session_state.get("pw_reset_done"):
@@ -702,7 +797,6 @@ def page_dashboard(records: list) -> None:
     user = st.session_state.user
     page_header("Dashboard", "Welcome back! Here's your trade intelligence overview.", "📈")
 
-    # Onboarding tour — shown once for new users on dashboard
     if should_show_tour():
         render_onboarding_tour()
 
@@ -881,7 +975,6 @@ def page_trade_analysis(records: list) -> None:
         if result.get("risk_flags") and result["risk_flags"] not in (None, "null", "none", "None", ""):
             st.error(f"🚨 **Risk Flags:** {result['risk_flags']}")
 
-    # Plain English Summary
     if result.get("plain_summary"):
         st.markdown("---")
         st.markdown(f"""<div style="background:#0d2040;border:1px solid #1a6fa8;border-radius:12px;
@@ -1037,7 +1130,6 @@ Add to `.env` if PATH still fails: `TESSERACT_CMD=C:\\Program Files\\Tesseract-O
     st.markdown("---")
     st.markdown("### 📋 Analysis Result")
 
-    # Compliance status banner
     status   = (result.get("compliance_status") or "OK").strip()
     doc_name = result.get("document_type") or result.get("_filename") or "Document"
     if status in ("OK","CLEAR"):
@@ -1047,7 +1139,6 @@ Add to `.env` if PATH still fails: `TESSERACT_CMD=C:\\Program Files\\Tesseract-O
     else:
         st.info(f"ℹ️ **{doc_name}** — Status: {status}")
 
-    # AI plain English verdict
     notes = (result.get("compliance_notes") or "").strip()
     if notes:
         st.markdown(f"""<div style="background:#0d2040;border:1px solid #1a6fa8;
@@ -1056,7 +1147,6 @@ Add to `.env` if PATH still fails: `TESSERACT_CMD=C:\\Program Files\\Tesseract-O
           <div style="color:#e2e8f0;font-size:0.92rem;line-height:1.6;">{notes}</div></div>""",
             unsafe_allow_html=True)
 
-    # Filter placeholder strings
     def _real(v):
         if v is None: return None
         s = str(v).strip()
@@ -1064,7 +1154,6 @@ Add to `.env` if PATH still fails: `TESSERACT_CMD=C:\\Program Files\\Tesseract-O
                          "fob/cif/etc or null","incoterm or null","unknown"): return None
         return s
 
-    # Key fields
     doc_num  = _real(result.get("document_number"))
     doc_date = _real(result.get("document_date"))
     incoterm = _real(result.get("incoterm"))
@@ -1085,7 +1174,6 @@ Add to `.env` if PATH still fails: `TESSERACT_CMD=C:\\Program Files\\Tesseract-O
     if not any([doc_num, doc_date, incoterm, total_val]):
         st.caption("ℹ️ Header fields not found — they may not appear in this document type.")
 
-    # Parties — handle new schema (exporter.name) AND old schema (parties.exporter)
     parties = result.get("parties") or {}
     exp = result.get("exporter") or {}
     imp = result.get("importer") or {}
@@ -1106,7 +1194,6 @@ Add to `.env` if PATH still fails: `TESSERACT_CMD=C:\\Program Files\\Tesseract-O
             ec2.markdown("**Importer/Buyer:** " + imp_name +
                          (f" · {_real(imp.get('country',''))}" if _real(imp.get("country")) else ""))
 
-    # Products — handle new schema AND old product_details schema
     products = result.get("products") or []
     if not products:
         pd_raw = result.get("product_details") or {}
@@ -1133,7 +1220,6 @@ Add to `.env` if PATH still fails: `TESSERACT_CMD=C:\\Program Files\\Tesseract-O
         if rows:
             st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
-    # Flags, missing, recommendations
     flags          = result.get("flags") or result.get("compliance_flags") or []
     missing        = result.get("missing_critical_fields") or result.get("missing_information") or []
     recommendations= result.get("recommendations") or []
@@ -1211,9 +1297,9 @@ def page_profile() -> None:
         st.markdown("#### 🎓 Guided Tour")
         st.caption("Re-take the onboarding tour to rediscover features.")
         if st.button("🎓 Start Tour Again", key="restart_tour"):
-            # Clear tour flag so it shows again on dashboard
             try:
-                from onboarding_tour import _TOUR_KEY
+                # NOTE: _TOUR_KEY must be exported from utils/onboarding_tour.py
+                from utils.onboarding_tour import _TOUR_KEY
                 st.session_state.pop(_TOUR_KEY, None)
             except Exception:
                 st.session_state.pop("tour_shown", None)
@@ -1399,7 +1485,8 @@ def page_hs_engine() -> None:
         with col_note:
             st.caption("Direct lookup from ITC-HS 2022 dataset — no AI, instant result")
         if lookup_btn and hs_input.strip():
-            from hs_engine import lookup_hs_code
+            # NOTE: lookup_hs_code moved from hs_engine → core.hs_engine
+            from core.hs_engine import lookup_hs_code
             r = lookup_hs_code(hs_input.strip())
             st.session_state.hs_direct_result = r
             st.session_state.hs_direct_code   = hs_input.strip()
@@ -1600,7 +1687,6 @@ def page_price_intelligence() -> None:
     import re as _re2
 
     def _extract_num(val) -> float:
-        """Pull number from: int/float, nested dict (typical/min/max), or string."""
         if isinstance(val, (int, float)) and val != 0:
             return float(val)
         if isinstance(val, dict):
@@ -1625,7 +1711,6 @@ def page_price_intelligence() -> None:
     def _unit(obj) -> str:
         return obj.get("unit","") if isinstance(obj, dict) else ""
 
-    # Flat top-level fields (new nvidia_service format) take priority
     fob_val  = _extract_num(result.get("fob_usd") or result.get("india_fob_price_usd") or result.get("fob_india_price_usd", 0))
     dom_val  = _extract_num(result.get("dom_inr") or result.get("india_domestic_price_inr", 0))
     lnd_val  = _extract_num(result.get("landed_usd") or result.get("target_market_landed_usd") or result.get("cif_destination_usd", 0))
@@ -1643,7 +1728,6 @@ def page_price_intelligence() -> None:
         except: mgn_min = 0.0
         try: mgn_max = float(parts[-1])
         except: mgn_max = mgn_min
-    # Also check flat fields from new format
     if not mgn_min: mgn_min = _extract_num(result.get("margin_min_pct",0))
     if not mgn_max: mgn_max = _extract_num(result.get("margin_max_pct",0))
 
@@ -1696,6 +1780,10 @@ def page_price_intelligence() -> None:
     if state_adv: st.info(f"📍 **State Advantage:** {state_adv}")
     st.warning(result.get("data_note","⚠️ Indicative price estimates. Verify with real market quotes before trading."))
     _download_row(result, product.strip(), "Price-Intel", user["email"])
+
+# ════════════════════════════════════════════════════════════════════
+# PAGE: COMPLIANCE CHECKER
+# ════════════════════════════════════════════════════════════════════
 def page_compliance_checker() -> None:
     user = st.session_state.user
     page_header("Trade Compliance Checker", "SCOMET controls, DGFT policy, licences & documentation", "📋")
@@ -1725,10 +1813,8 @@ def page_compliance_checker() -> None:
         if result and "error" in result: st.error(f"❌ {result['error']}")
         return
 
-    # ── Overall status — handle both field name variants ──────────
     overall = (result.get("overall_compliance_status")
                or result.get("compliance_status", "CLEAR"))
-    # Normalise old schema values
     status_map = {"Clear": "CLEAR", "Clear ": "CLEAR",
                   "Review Required": "CONDITIONAL", "Action Needed": "BLOCKED"}
     overall = status_map.get(overall, overall)
@@ -1738,15 +1824,12 @@ def page_compliance_checker() -> None:
     elif overall == "CONDITIONAL": st.warning(f"⚠️ **{overall}** — {summary}")
     else:                          st.error(f"🚫 **{overall}** — {summary}")
 
-    # ── Checks — handle BOTH dict (new schema) and list (old schema) ──
     checks_raw = result.get("checks", {})
     check_labels = {"scomet_control": "🔬 SCOMET", "dgft_policy": "📜 DGFT",
                     "un_sanctions": "🌐 UN Sanctions", "prohibited_items": "🚫 Prohibited",
                     "licence_required": "📄 Licence", "quality_standards": "✅ Quality"}
 
     if isinstance(checks_raw, list):
-        # Old schema: [{"check": "Export License", "status": "Pass", "details": "..."}]
-        # Convert list to dict keyed by our standard keys using name mapping
         list_to_key = {
             "export license": "licence_required", "scomet": "scomet_control",
             "sanctions": "un_sanctions", "documentation": "quality_standards",
@@ -1757,14 +1840,12 @@ def page_compliance_checker() -> None:
             name   = item.get("check", "").lower()
             status = item.get("status", "—")
             detail = item.get("details", "")
-            # Map status values: Pass→CLEAR, Fail→BLOCKED, Check→REVIEW
             status_norm = {"Pass": "CLEAR", "Fail": "BLOCKED", "Check": "REVIEW",
                            "pass": "CLEAR", "fail": "BLOCKED"}.get(status, status)
             for keyword, std_key in list_to_key.items():
                 if keyword in name and std_key not in checks_dict:
                     checks_dict[std_key] = {"status": status_norm, "detail": detail}
                     break
-        # Fill missing keys with CLEAR defaults
         for k in check_labels:
             if k not in checks_dict:
                 checks_dict[k] = {"status": "CLEAR", "detail": "No issues found"}
@@ -1826,7 +1907,6 @@ def page_competitor_intelligence() -> None:
         if result and "error" in result: st.error(f"❌ {result['error']}")
         return
 
-    # ── Safe numeric extraction (AI sometimes returns "15%" instead of 15) ──
     def _num(v, default=0):
         if v is None: return default
         if isinstance(v, (int, float)): return v
@@ -1866,7 +1946,6 @@ def page_competitor_intelligence() -> None:
         st.markdown("**⚠️ India's Weaknesses**")
         for w in result.get("india_weaknesses", []): st.markdown(f"- {w}")
 
-    # Win strategy — handle both field name variants
     strategy = (result.get("differentiation_strategy")
                 or result.get("recommended_strategy")
                 or result.get("pricing_strategy", ""))
@@ -1875,7 +1954,6 @@ def page_competitor_intelligence() -> None:
     else:
         st.info("**🎯 Win Strategy:** Focus on quality certification, competitive pricing, and building long-term buyer relationships.")
 
-    # Quick wins if present
     qw = result.get("quick_win_opportunities", [])
     if qw:
         st.markdown("**⚡ Quick Wins:**")
@@ -2241,7 +2319,8 @@ def page_support() -> None:
 # PAGE: DATA SYNC (admin only)
 # ════════════════════════════════════════════════════════════════════
 def page_data_sync(records: list) -> None:
-    from supabase_service import supabase as _sb
+    # NOTE: supabase client object must be exported from database/db.py as `supabase`
+    from database.db import supabase as _sb
     import re as _re
     if not st.session_state.user.get("is_admin", False):
         st.error("🚫 Access denied.")
@@ -2278,10 +2357,11 @@ def page_data_sync(records: list) -> None:
 # MAIN ROUTER
 # ════════════════════════════════════════════════════════════════════
 def main() -> None:
-    # ── One-time startup checks (env vars + DB schema) ─────────────
+    # ── One-time startup checks (env vars + DB schema) ──────────────
     if not st.session_state.get("_startup_checked"):
         try:
-            from env_validator import validate_environment
+            # NOTE: validate_environment must be exported from utils/helpers.py
+            from utils.helpers import validate_environment
             env_result = validate_environment()
             if env_result["status"] == "error":
                 st.error("❌ **Missing environment variables.** Check your `.env` file:")
@@ -2295,8 +2375,8 @@ def main() -> None:
             pass  # env_validator optional
 
         try:
-            from db_schema_checker import assert_schema_ready
-            from supabase_service import supabase as _sb
+            # NOTE: assert_schema_ready must be exported from database/db.py
+            from database.db import assert_schema_ready, supabase as _sb
             schema_result = assert_schema_ready(_sb)
             if schema_result.get("status") == "warning":
                 st.warning(
@@ -2307,26 +2387,27 @@ def main() -> None:
             pass  # Never block the app on schema check
 
         try:
-            from graceful_shutdown import setup_shutdown_handlers
+            # NOTE: setup_shutdown_handlers must be exported from utils/helpers.py
+            from utils.helpers import setup_shutdown_handlers
             setup_shutdown_handlers()
         except Exception:
             pass
 
         st.session_state["_startup_checked"] = True
 
-    # ── Not logged in → show login page ────────────────────────────
+    # ── Not logged in → show login page ─────────────────────────────
     if not st.session_state.user:
         login_page()
         return
 
-    # ── Post-confirmation welcome banner ───────────────────────────
+    # ── Post-confirmation welcome banner ────────────────────────────
     if st.session_state.get("just_confirmed"):
         st.session_state.pop("just_confirmed", None)
         st.success(f"🎉 Welcome to the Indian Trade Intelligence Engine, "
                    f"**{st.session_state.user.get('email','')}**! Your account is active.")
         st.balloons()
 
-    # ── Sidebar + page dispatch ─────────────────────────────────────
+    # ── Sidebar + page dispatch ──────────────────────────────────────
     active_page = render_sidebar(st.session_state.user)
     records     = get_trade_data()
 

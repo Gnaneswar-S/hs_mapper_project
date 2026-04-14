@@ -4,7 +4,7 @@
 # DB logging and rate-limit consumption happen in app.py after each call.
 
 import logging
-from input_sanitizer import (
+from utils.input_sanitizer import (
     sanitize_prompt_input,
     sanitize_product_name,
     validate_country_code,
@@ -13,7 +13,7 @@ from input_sanitizer import (
 
 logger = logging.getLogger("trade_advisor")
 
-from nvidia_service import (
+from services.nvidia_service import (
     _call_llama,
     chat_with_tradegpt as _chat,
     analyze_trade_risk as _risk,

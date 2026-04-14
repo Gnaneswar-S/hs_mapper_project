@@ -18,7 +18,7 @@ Admin email notifications on every new ticket.
 
 import os
 from datetime import datetime, timezone
-from supabase_service import supabase, send_email_alert
+from services.supabase_service import supabase, send_email_alert
 
 # ── Config ────────────────────────────────────────────────────
 TICKET_TYPES = {
